@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "choborunner-ai"
+version = "0.1.0"
+description = "ChoboRunner AI server — running pose analysis (capstone)"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+authors = [{ name = "Tae-young Kim" }]
+dependencies = [
+    "mediapipe>=0.10.9",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0,<2.0.0",  # mediapipe 호환성, CLAUDE.md §2
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "ruff>=0.3",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100  # CLAUDE.md §6
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

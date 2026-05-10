@@ -187,6 +187,18 @@ demo2는 dict 기반 schema 1.1. 본 레포는 Pydantic `BaseModel` 기반 schem
 - **Docstring**: Google 스타일. 임계값·알고리즘 상수는 출처 인용 포함.
 - **언어**: 코드 식별자 영어, 사용자 노출 메시지 한국어, 주석 한국어 가능.
 - **Line length**: 100자 (ruff 설정).
+- **Commit 메시지**: `<type>: <한국어 요약>` 형식. type은 영어 (`chore` / `feat` / `fix` / `docs` / `refactor` / `test`), 요약과 본문은 한국어. 본문은 변경 내용을 `-` 항목으로 나열. PowerShell에서는 `-m` 여러 개로 한 줄 처리.
+
+  예시:
+
+  ```
+  chore: 프로젝트 스켈레톤 + AI 작업 가이드 추가
+
+  - 7개 설계문서에 대응하는 모듈 디렉토리 구조 생성
+  - src/choborunner_ai/ 패키지 레이아웃
+  ```
+
+  - Co-Authored-By 라인은 추가하지 않는다 (CLAUDE.md로 프로젝트 레벨 disclose).
 
 ---
 
@@ -251,8 +263,8 @@ demo2는 0건 → 본 레포는 **모든 PR에 테스트 동반**.
 |---|---|---|
 | 0 | 레포 생성, 환경 셋업, git 초기화 | ✅ 완료 |
 | 1 | 디렉토리 구조 + 빈 파일 36개 | ✅ 완료 |
-| **2** | **`pyproject.toml` + 의존성 설치** | **다음** |
-| 3 | `config.py` (Pydantic Settings) | 대기 |
+| 2 | `pyproject.toml` + 의존성 설치 | ✅ 완료 |
+| **3** | **`config.py` (Pydantic Settings)** | **다음** |
 | 4 | CLAUDE.md (본 파일) | ✅ 완료 |
 | 5 | demo2 → `legacy/` 이식 | 대기 |
 | 6 | 설계문서 7개 docs/에 배치 | 대기 |
@@ -292,3 +304,4 @@ demo2는 0건 → 본 레포는 **모든 PR에 테스트 동반**.
 - 2026-05-10 v1: 초안. Step 0~1 완료 시점, Step 2 직전. demo2 분석 결과 + 작업자 결정사항.
 - 2026-05-10 v2: 작업 모드 규칙 추가.
 - 2026-05-10 v3: 개인 규칙은 `CLAUDE.local.md`로 분리. 본 파일은 팀 공유 컨텍스트만.
+- 2026-05-10 v4: §6에 commit 메시지 컨벤션 추가.
