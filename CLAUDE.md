@@ -147,12 +147,16 @@ ChoboRunner-AI-server/
 
 ### 5-2. 임계값 — 모두 `config.py`, 재교정 필요는 ⚠️
 
-**결정**: 분류 임계값은 `config.py`의 `ClassificationThresholds`에만 존재. interpretation·feedback에서 직접 박지 말 것.
+**결정**: 분류 임계값은 `config.py`의 영역별 sub-config (`FootStrikeConfig`, `KneeFlexionConfig`, `TrunkLeanConfig` 등)에만 존재. interpretation·feedback에서 직접 박지 말 것.
 
-**⚠️ 중요 — Knee Flexion 임계값**:
-4개 임계값 (`knee_stiff_below_deg`, `knee_optimal_low_deg`, `knee_optimal_high_deg`, `knee_excessive_above_deg`)은 **3D mocap 기반**인데 측정은 **2D MediaPipe 정규화 좌표**. 체계적 mismatch 위험. PoC 테스트(jaemin 케이스, knee=42.2°)에서 평범한 러너가 `excessive_tendency`로 오분류됨.
+**⚠️ 중요 — Knee Flexion 임계값** (docs/2-3-4 v2.1):
+2개 임계값 (`below_typical_deg=15.0`, `above_typical_deg=25.0`)으로 3분류 (Below Typical / Typical / Above Typical). 출처는 **3D mocap 기반** (Teng & Powers 2014 등)인데 측정은 **2D MediaPipe 정규화 좌표**. 체계적 mismatch 위험. PoC 테스트(jaemin 케이스, knee=42.2°)에서 평범한 러너가 4분류 v1 schema의 `excessive_tendency`로 오분류된 사례 있음 — v2.1 3분류로 schema 단순화.
 
-**v1 PoC 정책**: 일단 demo2 임계값 유지 + 코드에 경고 주석. 영상 파일럿 5~10개 수집 후 재교정 (별도 마일스톤). 임의 변경 금지 — 작업자와 합의 후에만.
+**v1 PoC 정책**: docs/2-3-4 v2.1 임계값 유지 + 코드에 ⚠️ 주석. 영상 파일럿 5~10개 수집 후 재교정 (별도 마일스톤). 임의 변경 금지 — 작업자와 합의 후에만.
+
+**schema 변경 이력**:
+- v1 (CLAUDE.md 초안, demo2 호환): 4분류 (stiff / optimal_low / optimal_high / excessive)
+- v2.1 (docs/2-3-4, 채택): 3분류 (Below Typical / Typical / Above Typical)
 
 ### 5-3. 좌표계 — 2D 영상 좌표만 (v1)
 
@@ -178,7 +182,7 @@ demo2는 dict 기반 schema 1.1. 본 레포는 Pydantic `BaseModel` 기반 schem
 
 ## 6. 코드 컨벤션
 
-- **모듈화**: 설계문서 1개 = 모듈 1개. 한 파일 300줄 미만 유지.
+- **모듈화**: 설계문서 1개 = 모듈 1개. 한 파일 300줄 미만 유지 (설계문서 다중 통합 모듈은 예외 — 예: `config.py`는 2-3-1~7 통합이라 예외).
 - **로직과 오케스트레이션 분리**: `pipeline.py`는 조립만. 계산 로직은 각 모듈.
 - **Pydantic 일관성**: 설정 = `BaseSettings`, API 스키마 = `BaseModel`. 모듈 경계에서 raw dict 금지.
 - **매직넘버 금지**: 모든 상수는 `config.py`. 인용 또는 `# ⚠️ heuristic` 표시 필수.
@@ -305,3 +309,4 @@ demo2는 0건 → 본 레포는 **모든 PR에 테스트 동반**.
 - 2026-05-10 v2: 작업 모드 규칙 추가.
 - 2026-05-10 v3: 개인 규칙은 `CLAUDE.local.md`로 분리. 본 파일은 팀 공유 컨텍스트만.
 - 2026-05-10 v4: §6에 commit 메시지 컨벤션 추가.
+- 2026-05-10 v5: §5-2 Knee Flexion schema를 docs/2-3-4 v2.1 (3분류) 정합으로 업데이트. §6 모듈화 가이드에 config.py 예외 추가.
