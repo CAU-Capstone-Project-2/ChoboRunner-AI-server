@@ -4,13 +4,14 @@
 이 모듈 하나에서 관리한다 (CLAUDE.md §6, §8).
 
 본 모듈에서 다루는 영역:
+- 2-3-1 (입력 영상 메타데이터): InputMetadata
 - 2-3-4 (자세 지표 산출 + IC hybrid 검출): Smoothing / FrameQuality /
   ICDetector / StrideAggregation / FootStrike / KneeFlexion / TrunkLean
 - 2-3-5 (Pose 후 품질 검사 + 분석 상태값): VisibilityCheck / SideView /
   AnalysisSide / TrackingStability / StrideExclusion / MetricVariability /
   ICValidation
 
-2-3-1/2/3/6/7 영역은 해당 docs 확정 후 추가한다.
+2-3-2/3/6/7 영역은 해당 docs 확정 후 추가한다.
 
 참고문헌:
 - Zeni, J. A., Richards, J. G., & Higginson, J. S. (2008).
@@ -31,6 +32,74 @@
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# ============================================================
+# 2-3-1. 입력 영상 메타데이터 (input_validator.py)
+# ============================================================
+
+
+class InputMetadataConfig(BaseModel):
+    """입력 영상 메타데이터 검증 임계 (docs/2-3-1 §3, §3-5).
+
+    누적 검증 (분석 종료 시점): 누적 분석 시간 / Effective FPS / 누적 frame 수.
+    즉시 검증 (첫 frame 시점): 해상도.
+    분석 종료 trigger: timeout (reason code 아님).
+
+    상태값 결정 우선순위는 `failed > low_confidence > success` (§3-2).
+    duration_sec 또는 frame_count 중 하나라도 위반 시 `too_short` 트리거.
+
+    ⚠️ 파일럿 보정 필요. 본 모듈에서 6번째 ⚠️ 클래스.
+
+    ⚠️ 두 임계 특별 주의:
+    - `effective_fps_*`: 네트워크 환경(LTE/5G/Wi-Fi)에 따라 frame drop으로
+      effective fps 변동. nominal 30fps 캡처해도 effective는 18~22fps까지
+      떨어질 수 있음. docs/2-3-1 §6 실험 계획 따라 보정 필요.
+    - `analysis_end_timeout_sec`: 백엔드 WebSocket heartbeat interval보다
+      짧으면 연결 살아있는데 분석 종료 오판정. 파일럿 후 1.5~3.0초 범위
+      보정. docs/2-3-1 §3-5 참조.
+    """
+
+    duration_failed_sec: float = Field(
+        default=5.0,
+        ge=0.0,
+        description="누적 분석 시간 failed 임계 (초). 미만 시 reason_code='too_short' (failed). duration 또는 frame_count 중 하나라도 위반 시 too_short. 출처: docs/2-3-1 §3-1.",
+    )
+    duration_low_confidence_sec: float = Field(
+        default=10.0,
+        ge=0.0,
+        description="누적 분석 시간 low_confidence 상한 = 권장 기준 하한 (초). 미만 시 reason_code='too_short' (low_confidence). 출처: docs/2-3-1 §3-1.",
+    )
+    effective_fps_failed_threshold: float = Field(
+        default=24.0,
+        ge=0.0,
+        description="Effective FPS failed 임계. 미만 시 reason_code='low_fps' (failed). ⚠️ 네트워크 환경 보정 필요 (docs/2-3-1 §6 실험 계획). 출처: docs/2-3-1 §3-1.",
+    )
+    effective_fps_low_confidence_threshold: float = Field(
+        default=30.0,
+        ge=0.0,
+        description="Effective FPS low_confidence 상한 = 권장 기준 하한. 미만 시 reason_code='low_fps' (low_confidence). ⚠️ 네트워크 환경 보정 필요. 출처: docs/2-3-1 §3-1.",
+    )
+    min_resolution_long_edge_px: int = Field(
+        default=720,
+        ge=1,
+        description="해상도 (긴 변 기준) failed 임계 (픽셀). 미만 시 reason_code='low_resolution' (failed, 즉시 검증 §3-4). low_confidence 임계 없음 (§3-1 표 '별도 임계 없음'). 출처: docs/2-3-1 §3-1.",
+    )
+    frame_count_failed: int = Field(
+        default=120,
+        ge=1,
+        description="누적 frame 수 failed 임계. 미만 시 reason_code='too_short' (failed). duration 또는 frame_count 중 하나라도 위반 시 too_short. 출처: docs/2-3-1 §3-1.",
+    )
+    frame_count_low_confidence: int = Field(
+        default=240,
+        ge=1,
+        description="누적 frame 수 low_confidence 상한 = 권장 기준 하한. 미만 시 reason_code='too_short' (low_confidence). 출처: docs/2-3-1 §3-1.",
+    )
+    analysis_end_timeout_sec: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="자동 분석 종료 timeout (초). 마지막 frame 수신 후 본 시간 동안 추가 frame 미도착 시 분석 종료 trigger. trigger이며 reason code 아님. ⚠️ 백엔드 heartbeat 동기화 필요, 1.5~3.0초 범위 보정 예정. 출처: docs/2-3-1 §3-5.",
+    )
 
 
 # ============================================================
@@ -493,6 +562,9 @@ class AppConfig(BaseSettings):
         extra="ignore",
     )
 
+    # ── 2-3-1 입력 영상 메타데이터 ──────────────────────────
+    input_metadata: InputMetadataConfig = Field(default_factory=InputMetadataConfig)
+
     # ── 2-3-4 자세 지표 산출 ───────────────────────────────
     smoothing: SmoothingConfig = Field(default_factory=SmoothingConfig)
     frame_quality: FrameQualityConfig = Field(default_factory=FrameQualityConfig)
@@ -511,7 +583,7 @@ class AppConfig(BaseSettings):
     variability: MetricVariabilityConfig = Field(default_factory=MetricVariabilityConfig)
     ic_validation: ICValidationConfig = Field(default_factory=ICValidationConfig)
 
-    # ── 2-3-1/2/3/6/7 영역 — 해당 docs 확정 후 추가 ────────
+    # ── 2-3-2/3/6/7 영역 — 해당 docs 확정 후 추가 ────────
 
 
 app_config = AppConfig()
