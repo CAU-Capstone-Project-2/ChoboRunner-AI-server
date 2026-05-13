@@ -4,10 +4,11 @@
 대응 카테고리:
 - 즉시 검증 (첫 frame 시점): 해상도, decode 가능 여부
 - 누적 검증 (분석 종료 시점): duration, effective fps, frame count
+- 통합 (세션 종료): aggregate_results, validate_session
 
 임계값 출처: InputMetadataConfig (config.py).
 본 모듈은 임계값을 직접 박지 않고 DI(Dependency Injection)으로
-InputMetadataConfig를 받음.
+InputMetadataConfig 또는 AppConfig를 받음.
 
 ⚠️ Day 4~ 보정 마일스톤:
 - effective_fps_failed_threshold (24fps): 실측 환경에서 18~22fps 빈발 가능,
@@ -22,11 +23,12 @@ References:
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
-from choborunner_ai.config import InputMetadataConfig
+from choborunner_ai.config import AppConfig, InputMetadataConfig
 
 if TYPE_CHECKING:
     import numpy as np
@@ -273,3 +275,110 @@ def validate_frame_count(
             },
         )
     return ValidationResult(status=ValidationStatus.OK)
+
+
+def aggregate_results(
+    named_results: list[tuple[str, ValidationResult]],
+) -> ValidationResult:
+    """여러 검증 결과를 우선순위 규칙으로 통합 (docs/2-3-1 §3-2).
+
+    우선순위: FAILED > LOW_CONFIDENCE > OK. 어느 한 항목이라도 FAILED면 최종
+    FAILED, LOW_CONFIDENCE 있으면 LOW_CONFIDENCE, 모두 OK면 OK.
+
+    reason 채택 규칙: 최악 status에 해당하는 **첫 매칭 항목의 reason** 채택.
+    호출자가 named_results 순서로 우선순위 표현 가능 (예: validate_session은
+    first_frame을 첫 항목으로 두어 해상도 실패가 다른 실패보다 먼저 보고됨).
+
+    Args:
+        named_results: (check_name, ValidationResult) 페어 리스트. check_name은
+            details.sub_results 구성과 외부 진단에 사용.
+
+    Returns:
+        ValidationResult — status=worst_status, reason=첫 매칭 reason,
+        details 구조:
+
+            {
+                "sub_results": [
+                    {"check_name", "status", "reason", "details"},
+                    ...
+                ],
+                "summary": {"total", "ok", "low_confidence", "failed"},
+            }
+
+    Raises:
+        ValueError: named_results가 빈 리스트.
+    """
+    if not named_results:
+        raise ValueError("empty results")
+    worst_status = max(r.status for _, r in named_results)
+    chosen_reason: str | None = None
+    for _, r in named_results:
+        if r.status == worst_status:
+            chosen_reason = r.reason
+            break
+    sub_results = [
+        {
+            "check_name": name,
+            "status": r.status.name,
+            "reason": r.reason,
+            "details": r.details,
+        }
+        for name, r in named_results
+    ]
+    counts = Counter(r.status for _, r in named_results)
+    summary = {
+        "total": len(named_results),
+        "ok": counts.get(ValidationStatus.OK, 0),
+        "low_confidence": counts.get(ValidationStatus.LOW_CONFIDENCE, 0),
+        "failed": counts.get(ValidationStatus.FAILED, 0),
+    }
+    return ValidationResult(
+        status=worst_status,
+        reason=chosen_reason,
+        details={"sub_results": sub_results, "summary": summary},
+    )
+
+
+def validate_session(
+    *,
+    first_frame_width: int,
+    first_frame_height: int,
+    received_frames: int,
+    duration_sec: float,
+    cfg: AppConfig,
+) -> ValidationResult:
+    """세션 종료 시점 누적 메타데이터 통합 검증 (docs/2-3-1 §3).
+
+    4개 검증 함수를 호출하고 `aggregate_results`로 우선순위 통합:
+
+    1. `validate_first_frame` — 해상도 (긴 변)
+    2. `validate_duration` — 누적 분석 시간
+    3. `validate_effective_fps` — 실수신 fps
+    4. `validate_frame_count` — 누적 frame 수
+
+    ⚠️ `validate_frame_decodable`은 본 함수에서 호출하지 않는다. decode 검증은
+    프레임 수신 중 즉시 검증(per-frame)이라 세션 종료 시점 호출 위치가 다름.
+    WebSocket handler에서 frame 수신 직후 별도 호출 예정.
+
+    keyword-only 시그니처 — 4개 숫자 인자가 의미 유사(특히 `received_frames`
+    와 `duration_sec`의 단위 혼동)해서 positional 호출 금지로 호출 명확성 확보.
+
+    Args:
+        first_frame_width: 첫 frame 픽셀 너비.
+        first_frame_height: 첫 frame 픽셀 높이.
+        received_frames: 수신·디코딩 성공한 frame 수 (frame_count와 동일 값).
+        duration_sec: 누적 분석 시간 (초).
+        cfg: AppConfig — 내부에서 `cfg.input_metadata` 사용.
+
+    Returns:
+        4개 검증의 통합 `ValidationResult`. result_serializer 입력으로 그대로
+        사용 가능.
+    """
+    meta = cfg.input_metadata
+    named_results: list[tuple[str, ValidationResult]] = [
+        ("first_frame", validate_first_frame(first_frame_width, first_frame_height, meta)),
+        ("duration", validate_duration(duration_sec, meta)),
+        ("effective_fps", validate_effective_fps(received_frames, duration_sec, meta)),
+        ("frame_count", validate_frame_count(received_frames, meta)),
+    ]
+    return aggregate_results(named_results)
