@@ -2,7 +2,7 @@
 Vertical Slice Demo — Trunk Lean only.
 
 본 스크립트는 회의 시연용 최소 동작 데모.
-7개 지표 중 Trunk Lean 1개만 시연하며,
+3개 핵심 지표 중 Trunk Lean 1개만 시연하며,
 Knee Flexion / Foot Strike Pattern은 의도적으로 제외.
 이유: src/choborunner_ai/metrics/trunk.py docstring 참조.
 """
