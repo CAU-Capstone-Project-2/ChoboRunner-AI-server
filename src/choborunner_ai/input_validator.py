@@ -24,7 +24,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from choborunner_ai.config import InputMetadataConfig
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class ValidationStatus(IntEnum):
@@ -51,3 +56,72 @@ class ValidationResult:
     status: ValidationStatus
     reason: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+
+
+def validate_first_frame(
+    width: int,
+    height: int,
+    cfg: InputMetadataConfig,
+) -> ValidationResult:
+    """첫 frame 시점 해상도 검증 (docs/2-3-1 §3-1, §3-4 즉시 검증).
+
+    긴 변 기준으로 비교한다 — 입력이 가로(landscape) / 세로(portrait) 어느
+    방향이든 회전과 무관하게 동일 임계 적용. low_confidence 단계 없음
+    (docs/2-3-1 §3-1 표의 비대칭 설계: 해상도 행 "별도 임계 없음" 명시).
+
+    Args:
+        width: frame 픽셀 너비.
+        height: frame 픽셀 높이.
+        cfg: 임계 출처 — `cfg.min_resolution_long_edge_px` 사용.
+
+    Returns:
+        - FAILED + reason="low_resolution" + details {"long_edge_px", "threshold"}:
+          긴 변이 임계 미만.
+        - 그 외 OK.
+    """
+    long_edge = max(width, height)
+    if long_edge < cfg.min_resolution_long_edge_px:
+        return ValidationResult(
+            status=ValidationStatus.FAILED,
+            reason="low_resolution",
+            details={
+                "long_edge_px": long_edge,
+                "threshold": cfg.min_resolution_long_edge_px,
+            },
+        )
+    return ValidationResult(status=ValidationStatus.OK)
+
+
+def validate_frame_decodable(frame: np.ndarray | None) -> ValidationResult:
+    """디코딩 결과 frame의 구조 검증 (docs/2-3-1 §3-4 즉시 검증).
+
+    `cv2.VideoCapture.read()`가 실패하면 None을 반환할 수 있으므로 None을
+    안전하게 처리한다. 임계값 의존이 없는 구조 검증이므로 cfg 인자가 없음.
+
+    Args:
+        frame: BGR np.ndarray (H, W, 3) 또는 None.
+
+    Returns:
+        - FAILED + reason="decode_failed" + details {"cause": "frame_is_none"}:
+          frame이 None.
+        - FAILED + reason="decode_failed" + details {"cause": "invalid_shape", ...}:
+          (H, W, 3) 형태가 아님.
+        - 그 외 OK.
+    """
+    if frame is None:
+        return ValidationResult(
+            status=ValidationStatus.FAILED,
+            reason="decode_failed",
+            details={"cause": "frame_is_none"},
+        )
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        return ValidationResult(
+            status=ValidationStatus.FAILED,
+            reason="decode_failed",
+            details={
+                "cause": "invalid_shape",
+                "ndim": int(frame.ndim),
+                "shape": tuple(int(s) for s in frame.shape),
+            },
+        )
+    return ValidationResult(status=ValidationStatus.OK)
