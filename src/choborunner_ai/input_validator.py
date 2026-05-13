@@ -125,3 +125,151 @@ def validate_frame_decodable(frame: np.ndarray | None) -> ValidationResult:
             },
         )
     return ValidationResult(status=ValidationStatus.OK)
+
+
+def validate_duration(
+    duration_sec: float,
+    cfg: InputMetadataConfig,
+) -> ValidationResult:
+    """누적 분석 시간 검증 (docs/2-3-1 §3-1 누적 검증).
+
+    분기 (cfg default 기준):
+    - duration_sec < 5.0초          → FAILED, reason="too_short"
+    - 5.0초 ≤ duration_sec < 10.0초 → LOW_CONFIDENCE, reason="short_duration"
+    - 그 외                         → OK
+
+    low_confidence 의미: docs/2-3-5 §6-1 — 결과 제공 + 재촬영 권장 메시지
+    동시 표시.
+
+    Args:
+        duration_sec: 누적 분석 시간 (초).
+        cfg: 임계 출처 — `duration_failed_sec`, `duration_low_confidence_sec`.
+
+    Returns:
+        FAILED / LOW_CONFIDENCE / OK 중 하나, 측정값·임계 details 포함.
+    """
+    if duration_sec < cfg.duration_failed_sec:
+        return ValidationResult(
+            status=ValidationStatus.FAILED,
+            reason="too_short",
+            details={
+                "duration_sec": duration_sec,
+                "threshold": cfg.duration_failed_sec,
+            },
+        )
+    if duration_sec < cfg.duration_low_confidence_sec:
+        return ValidationResult(
+            status=ValidationStatus.LOW_CONFIDENCE,
+            reason="short_duration",
+            details={
+                "duration_sec": duration_sec,
+                "threshold": cfg.duration_low_confidence_sec,
+            },
+        )
+    return ValidationResult(status=ValidationStatus.OK)
+
+
+def validate_effective_fps(
+    received_frames: int,
+    duration_sec: float,
+    cfg: InputMetadataConfig,
+) -> ValidationResult:
+    """Effective FPS 검증 (docs/2-3-1 §3-1 누적 검증).
+
+    Effective FPS = `received_frames / duration_sec`. nominal fps (Android
+    캡처 설정값) 아닌, AI 서버가 실제 수신·디코딩에 성공한 frame 수 기준
+    (§3-1 주석).
+
+    분기 (cfg default 기준):
+    - duration_sec ≤ 0                  → FAILED, reason="invalid_duration"
+      (ZeroDivisionError 방어, fps 계산 불가)
+    - effective_fps < 24.0              → FAILED, reason="low_fps"
+    - 24.0 ≤ effective_fps < 30.0       → LOW_CONFIDENCE, reason="borderline_fps"
+    - 그 외                             → OK
+
+    ⚠️ 24fps 임계 보정 마일스톤 (모듈 docstring 참조):
+    실측 환경에서 nominal 30fps 캡처해도 effective는 18~22fps까지 떨어질 수
+    있음. LTE/5G/Wi-Fi 환경 측정 후 임계 보정 예정 (docs/2-3-1 §6).
+
+    Args:
+        received_frames: 분석 종료까지 수신·디코딩 성공한 frame 수.
+        duration_sec: 누적 분석 시간 (초).
+        cfg: 임계 출처.
+
+    Returns:
+        FAILED / LOW_CONFIDENCE / OK 중 하나, 측정값·임계 details 포함.
+    """
+    if duration_sec <= 0.0:
+        return ValidationResult(
+            status=ValidationStatus.FAILED,
+            reason="invalid_duration",
+            details={"duration_sec": duration_sec, "note": "fps 계산 불가"},
+        )
+    effective_fps = received_frames / duration_sec
+    if effective_fps < cfg.effective_fps_failed_threshold:
+        return ValidationResult(
+            status=ValidationStatus.FAILED,
+            reason="low_fps",
+            details={
+                "effective_fps": round(effective_fps, 2),
+                "received_frames": received_frames,
+                "duration_sec": duration_sec,
+                "threshold": cfg.effective_fps_failed_threshold,
+            },
+        )
+    if effective_fps < cfg.effective_fps_low_confidence_threshold:
+        return ValidationResult(
+            status=ValidationStatus.LOW_CONFIDENCE,
+            reason="borderline_fps",
+            details={
+                "effective_fps": round(effective_fps, 2),
+                "received_frames": received_frames,
+                "duration_sec": duration_sec,
+                "threshold": cfg.effective_fps_low_confidence_threshold,
+            },
+        )
+    return ValidationResult(status=ValidationStatus.OK)
+
+
+def validate_frame_count(
+    frame_count: int,
+    cfg: InputMetadataConfig,
+) -> ValidationResult:
+    """누적 frame 수 검증 (docs/2-3-1 §3-1 누적 검증).
+
+    분기 (cfg default 기준):
+    - frame_count < 120         → FAILED, reason="insufficient_frames"
+    - 120 ≤ frame_count < 240   → LOW_CONFIDENCE, reason="borderline_frames"
+    - 그 외                     → OK
+
+    duration과 함께 `too_short` reason의 트리거 (§3-1 표 "duration 또는
+    frame_count 중 하나라도 위반 시 too_short"). 본 함수는 내부 진단 정확성
+    위해 `insufficient_frames`/`borderline_frames`로 분리한다. 외부 응답에서
+    `too_short`으로 묶을지는 상위 통합 함수(Phase 4) 책임.
+
+    Args:
+        frame_count: 누적 frame 수.
+        cfg: 임계 출처 — `frame_count_failed`, `frame_count_low_confidence`.
+
+    Returns:
+        FAILED / LOW_CONFIDENCE / OK 중 하나, 측정값·임계 details 포함.
+    """
+    if frame_count < cfg.frame_count_failed:
+        return ValidationResult(
+            status=ValidationStatus.FAILED,
+            reason="insufficient_frames",
+            details={
+                "frame_count": frame_count,
+                "threshold": cfg.frame_count_failed,
+            },
+        )
+    if frame_count < cfg.frame_count_low_confidence:
+        return ValidationResult(
+            status=ValidationStatus.LOW_CONFIDENCE,
+            reason="borderline_frames",
+            details={
+                "frame_count": frame_count,
+                "threshold": cfg.frame_count_low_confidence,
+            },
+        )
+    return ValidationResult(status=ValidationStatus.OK)
