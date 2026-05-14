@@ -1,18 +1,38 @@
-"""영상 디코딩 wrapper — Vertical Slice 단계.
+"""영상 디코딩 + frame-level 품질 검사 wrapper (docs/2-3-2).
 
-OpenCV `VideoCapture`를 얇게 감싸 BGR frame을 yield. 본 모듈은 2-3-2
-`video_preprocessor` 본 구현(frame-level 품질 검사 포함)이 들어오기 전 임시.
-지금은 rotation 적용 + frame_stride + meta 조회만 제공.
+본 모듈은 두 모드를 지원한다:
 
-좌표·색공간: OpenCV 기본 BGR. 회전 메타데이터는 디코더에서 읽어 표시 방향에
-맞춰 자동 적용 (휴대폰 세로 영상 호환).
+**Live mode (본 구현, docs/2-3-2 §2)**:
+- WebSocket binary frame stream 입력 (JPEG decode → 해상도 cap → timestamp →
+  품질 검사).
+- 입력 형식: bytes (JPEG) + capture_timestamp_ns.
+- 출력: `ProcessedFrame`.
+- Phase 2~5에서 점진 구현 예정. 본 Phase 1은 토대 (dataclass + Literal)만.
+
+**File mode (demo path, Vertical Slice 임시)**:
+- 영상 파일 경로 입력. OpenCV `VideoCapture` 기반.
+- 입력: `Path`.
+- 출력: BGR `np.ndarray` Iterator + `VideoMeta`.
+- 함수: `get_video_meta`, `iter_frames`.
+- 본 함수들은 회의 시연용 Vertical Slice 유지 목적 — docs/2-3-2 본 구현 완성 후
+  점진 deprecate 또는 file→live adapter로 재구성.
+
+좌표·색공간: OpenCV 기본 BGR. file mode는 OpenCV CAP_PROP_ORIENTATION_META 기반
+회전 자동 적용 (휴대폰 세로 영상 호환). live mode는 Android 측에서 회전 처리
+가정 (docs/2-3-2 §2 클라이언트 책임).
+
+품질 플래그 (docs/2-3-2 §4, §6):
+- `low_brightness`: 평균 휘도 < 50 (brightness_min)
+- `motion_blur`: Laplacian variance < 100 (laplacian_var_min)
+- `frame_unstable`: 인접 frame SSD 변화량 > 평균 × 2.0 (ssd_change_ratio_max)
+- `timestamp_fallback`: capture timestamp 누락 → AI 서버 수신 시각 사용
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Literal
 
 import cv2
 import numpy as np
@@ -20,9 +40,57 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+QualityFlag = Literal[
+    "low_brightness",
+    "motion_blur",
+    "frame_unstable",
+    "timestamp_fallback",
+]
+"""Frame-level 품질 플래그 (docs/2-3-2 §4, §6).
+
+여러 플래그가 동시에 활성화될 수 있다 (예: ["motion_blur", "frame_unstable"]).
+플래그 부여된 frame은 stride 누적에서 가중치 0 (docs/2-3-2 §4-4, 2-3-4 §10).
+"""
+
+
+@dataclass(eq=False)
+class ProcessedFrame:
+    """frame 단위 처리 결과 (docs/2-3-2 §6 출력 구조).
+
+    `eq=False` 이유: `image` 필드가 `np.ndarray`라 dataclass 자동 `__eq__`가
+    element-wise 비교를 생성해 bool ambiguous error 발생. 본 모듈에서 인스턴스
+    비교 의미 없으므로 eq 생성 비활성.
+
+    Attributes:
+        frame_index: 도착 순서 (시간 의미 없음).
+        timestamp_sec: capture timestamp 기준 (docs/2-3-2 §3-3). fallback 사용
+            시 `quality_flags`에 ``"timestamp_fallback"`` 포함.
+        image: BGR `np.ndarray` (H, W, 3) — 해상도 cap 적용 후 (docs/2-3-2 §3-2).
+        quality_flags: 품질 검사 결과 (docs/2-3-2 §4). 빈 list = 모두 통과.
+        fps_actual_recent: sliding window 기반 실측 fps (docs/2-3-2 §6).
+            최근 N frame (FramePreprocessConfig.fps_tracker_window) 인접
+            timestamp 간격 평균의 역수.
+    """
+
+    frame_index: int
+    timestamp_sec: float
+    image: np.ndarray
+    quality_flags: list[QualityFlag] = field(default_factory=list)
+    fps_actual_recent: float = 0.0
+
+
+# ============================================================
+# File mode (demo path, Vertical Slice 임시 — docs/2-3-2 본 구현 외)
+# ============================================================
+
+
 @dataclass
 class VideoMeta:
-    """디코딩 메타 — rotation 반영 후 표시 기준 크기."""
+    """File mode 디코딩 메타 — rotation 반영 후 표시 기준 크기.
+
+    demo path / Vertical Slice 임시. live mode에는 직접 대응 안 됨
+    (live mode는 ProcessedFrame.fps_actual_recent로 sliding window fps 추적).
+    """
 
     width: int
     height: int
@@ -77,7 +145,11 @@ def _open(video_path: Path) -> tuple[cv2.VideoCapture, VideoMeta]:
 
 
 def get_video_meta(video_path: Path) -> VideoMeta:
-    """영상 메타 (width, height, fps, frame_count, rotation) 단발 조회.
+    """영상 메타 단발 조회 — **demo path / Vertical Slice 임시**.
+
+    docs/2-3-2 live mode와 별개. demo_trunk.py가 영상 파일에서 fps·해상도·
+    frame_count 추출 시 사용. live mode는 ProcessedFrame.fps_actual_recent로
+    sliding window fps 추적.
 
     Args:
         video_path: 영상 파일 경로.
@@ -95,14 +167,17 @@ def get_video_meta(video_path: Path) -> VideoMeta:
 
 
 def iter_frames(video_path: Path, frame_stride: int = 1) -> Iterator[np.ndarray]:
-    """BGR frame을 rotation 적용 후 stride 간격으로 yield.
+    """BGR frame을 rotation 적용 후 stride 간격으로 yield — **demo path / Vertical Slice 임시**.
+
+    docs/2-3-2 live mode (WebSocket binary stream) 와 별개. demo_trunk.py가
+    영상 파일 처리 시 사용.
 
     Args:
         video_path: 영상 파일 경로.
         frame_stride: N마다 1 frame만 yield. 1이면 모든 frame.
 
     Yields:
-        BGR np.ndarray (height, width, 3) — rotation 반영 후 표시 방향.
+        BGR `np.ndarray` (height, width, 3) — rotation 반영 후 표시 방향.
 
     Raises:
         FileNotFoundError: 파일 부재.

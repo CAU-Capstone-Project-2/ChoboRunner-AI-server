@@ -103,6 +103,54 @@ class InputMetadataConfig(BaseModel):
 
 
 # ============================================================
+# 2-3-2. 영상 전처리 + Frame-level 품질 검사 (video_preprocessor.py)
+# ============================================================
+
+
+class FramePreprocessConfig(BaseModel):
+    """영상 정규화 (cap) + frame-level 품질 검사 임계 (docs/2-3-2 §3, §4).
+
+    영상 정규화 정책 (docs/2-3-2 §3): 30fps · 720p 상한 cap. 초과는 downsample,
+    미만은 원본 유지 (보간 X). Frame-level 품질 검사 3종 (docs/2-3-2 §4):
+    평균 휘도 / Laplacian variance / SSD 변화량.
+
+    ⚠️ 본 모든 임계값은 초기 default. 파일럿 데이터 검증 필요 (docs/2-3-2 §8).
+    """
+
+    fps_cap: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="목표 fps 상한 (Hz). 초과 입력은 30fps grid 최근접 채택, 미만은 원본 유지 (보간 X). 출처: docs/2-3-2 §3-1.",
+    )
+    resolution_long_side_cap: int = Field(
+        default=1280,
+        ge=1,
+        description="해상도 긴 변 상한 (픽셀). 초과 입력은 cv2.resize INTER_AREA, 미만은 원본 유지 (720p 기준). 출처: docs/2-3-2 §3-2.",
+    )
+    fps_tracker_window: int = Field(
+        default=30,
+        ge=1,
+        description="fps_actual_recent sliding window 크기 (frame). 최근 N frame 인접 timestamp 간격 평균의 역수. 출처: docs/2-3-2 §6.",
+    )
+    brightness_min: float = Field(
+        default=50.0,
+        ge=0.0,
+        le=255.0,
+        description="평균 휘도 임계 (grayscale 0~255). 미만 시 'low_brightness' 플래그. 정상 80~150. ⚠️ 파일럿 보정. 출처: docs/2-3-2 §4-1.",
+    )
+    laplacian_var_min: float = Field(
+        default=100.0,
+        ge=0.0,
+        description="Laplacian variance 임계 (모션 블러). 미만 시 'motion_blur' 플래그. 정상 200~1000. ⚠️ 파일럿 보정. 출처: docs/2-3-2 §4-2.",
+    )
+    ssd_change_ratio_max: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="인접 frame SSD 변화량의 평균 대비 임계 비율 (×200%). 초과 시 'frame_unstable' 플래그. ⚠️ 러닝 자체 움직임 오탐 위험 (docs/2-3-2 §4-3). 파일럿 보정.",
+    )
+
+
+# ============================================================
 # 2-3-4. 자세 지표 산출 (metrics/)
 # ============================================================
 
@@ -565,6 +613,9 @@ class AppConfig(BaseSettings):
     # ── 2-3-1 입력 영상 메타데이터 ──────────────────────────
     input_metadata: InputMetadataConfig = Field(default_factory=InputMetadataConfig)
 
+    # ── 2-3-2 영상 전처리 + Frame-level 품질 ───────────────
+    frame_preprocess: FramePreprocessConfig = Field(default_factory=FramePreprocessConfig)
+
     # ── 2-3-4 자세 지표 산출 ───────────────────────────────
     smoothing: SmoothingConfig = Field(default_factory=SmoothingConfig)
     frame_quality: FrameQualityConfig = Field(default_factory=FrameQualityConfig)
@@ -583,7 +634,7 @@ class AppConfig(BaseSettings):
     variability: MetricVariabilityConfig = Field(default_factory=MetricVariabilityConfig)
     ic_validation: ICValidationConfig = Field(default_factory=ICValidationConfig)
 
-    # ── 2-3-2/3/6/7 영역 — 해당 docs 확정 후 추가 ────────
+    # ── 2-3-3/6/7 영역 — 해당 docs 확정 후 추가 ────────
 
 
 app_config = AppConfig()
