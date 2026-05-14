@@ -349,3 +349,90 @@ def resolve_timestamp(
     if capture_ts is None:
         return (server_recv_ts, True)
     return (capture_ts, False)
+
+
+# ============================================================
+# Live mode — Phase 4 frame-level 품질 검사 3종 (stateless)
+# ============================================================
+
+
+def check_brightness(
+    frame: np.ndarray,
+    threshold: float = 50.0,
+) -> bool:
+    """평균 휘도 < threshold → True (`low_brightness` 플래그 부여 신호).
+
+    docs/2-3-2 §4-1: grayscale 평균. 정상 80~150, 50 미만은 visibility 광범위
+    저하 임계 영역. ⚠️ 파일럿 보정 (FramePreprocessConfig.brightness_min).
+
+    Args:
+        frame: BGR `np.ndarray` (H, W, 3).
+        threshold: 평균 휘도 임계 (default 50.0, 0~255 스케일).
+
+    Returns:
+        True면 `low_brightness` 플래그 부여 대상.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(gray.mean()) < threshold
+
+
+def check_motion_blur(
+    frame: np.ndarray,
+    laplacian_var_min: float = 100.0,
+) -> bool:
+    """Laplacian variance < min → True (`motion_blur` 플래그 부여 신호).
+
+    docs/2-3-2 §4-2: `cv2.Laplacian()` + `np.var()`. 이미지 엣지가 선명할수록
+    분산↑, 모션 블러로 뭉개지면 분산↓. 정상 200~1000, 100 미만 블러 임계.
+    ⚠️ 파일럿 보정 (FramePreprocessConfig.laplacian_var_min).
+
+    Args:
+        frame: BGR `np.ndarray` (H, W, 3).
+        laplacian_var_min: Laplacian variance 임계 (default 100.0).
+
+    Returns:
+        True면 `motion_blur` 플래그 부여 대상.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(lap.var()) < laplacian_var_min
+
+
+def check_frame_stability(
+    current: np.ndarray,
+    previous: np.ndarray | None,
+    ssd_change_ratio_max: float = 2.0,
+    ssd_baseline: float | None = None,
+) -> bool:
+    """SSD 변화량 > baseline × ratio_max → True (`frame_unstable` 플래그 신호).
+
+    docs/2-3-2 §4-3: 간단 버전 SSD(Sum of Squared Differences). 인접 frame 간
+    전체 픽셀 차이. ⚠️ 러닝 자체 움직임을 카메라 흔들림으로 오탐 가능 — 본 함수
+    리턴은 "frame-level 이상 변동 신호"로만 해석. 단정 카메라 흔들림 판정은
+    stride 단위로 보는 2-3-5가 담당.
+
+    보수 판정 가드 3개 (모두 False 반환):
+    - `previous` None (첫 frame, 비교 대상 없음)
+    - `ssd_baseline` None (baseline 미확정, Phase 5 통합 Preprocessor가 첫 N
+      frame에 baseline 누적 후 전달)
+    - `ssd_baseline <= 0` (zero-division 방어)
+
+    Args:
+        current: 현재 BGR frame.
+        previous: 직전 BGR frame (None이면 첫 frame, False 반환).
+        ssd_change_ratio_max: 임계 비율 (default 2.0 = 평균의 200%).
+        ssd_baseline: 최근 인접 SSD 평균 (None이면 baseline 미확정, False 반환).
+
+    Returns:
+        True면 `frame_unstable` 플래그 부여 대상.
+    """
+    if previous is None or ssd_baseline is None:
+        return False
+    # ⚠️ float64 사용 이유: int32 sum 오버플로 방어. 720p (921,600 픽셀) 입력
+    # 에서 픽셀당 diff² 최대 40,000 → 총 ≈3.69e10이 int32 max (2.15e9) 초과.
+    # float64는 10³⁰⁸ 범위라 4K 영상까지 안전.
+    diff = current.astype(np.float64) - previous.astype(np.float64)
+    ssd = float(np.sum(diff * diff))
+    if ssd_baseline <= 0:
+        return False
+    return (ssd / ssd_baseline) > ssd_change_ratio_max
