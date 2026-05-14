@@ -157,6 +157,59 @@ class FramePreprocessConfig(BaseModel):
 
 
 # ============================================================
+# 2-3-3. Pose Landmark 추출 (pose_extractor.py)
+# ============================================================
+
+
+class MediaPipePoseConfig(BaseModel):
+    """MediaPipe Pose Tasks API 사용 정책 (docs/2-3-3 §3).
+
+    Tasks API의 Pose Landmarker 사용 (Solution API 사용 X, §3-1).
+    Live stream mode (운영) / Video mode (검증·batch) 분리 (§3-3).
+    num_poses=1 단일 인물 — 분석 대상자 보장은 2-3-5 추적 안정성 위임 (§3-3).
+
+    ⚠️ 모델은 `full` default + `lite` 대체 후보. 파일럿 후 확정 (docs/2-3-3 §3-2).
+    visibility 안정성·추출 성공률·처리 시간 3 기준으로 평가.
+    """
+
+    model_name: str = Field(
+        default="full",
+        description="Pose Landmarker 모델 — 'full' (정확도 우선, 33 landmark) 또는 'lite' (~50% 빠름, 정확도 trade-off). ⚠️ 데모 영상 파일럿 후 확정. 출처: docs/2-3-3 §3-2.",
+    )
+    num_poses: int = Field(
+        default=1,
+        ge=1,
+        description="단일 인물 모드. 화면 다중 인물 시 MediaPipe 내부 휴리스틱으로 한 명 선택 — 분석 대상자 보장은 2-3-5 추적 안정성에 위임. 출처: docs/2-3-3 §3-3.",
+    )
+    min_pose_detection_confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="첫 포즈 검출 신뢰 임계. MediaPipe default. 출처: docs/2-3-3 §3-3.",
+    )
+    min_pose_presence_confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="매 프레임 포즈 존재 신뢰 임계. MediaPipe default. 출처: docs/2-3-3 §3-3.",
+    )
+    min_tracking_confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="추적 신뢰 임계. MediaPipe default. 출처: docs/2-3-3 §3-3.",
+    )
+    output_segmentation_masks: bool = Field(
+        default=False,
+        description="Segmentation mask 출력 여부. v1 사용 안 함 (메모리 절약). 출처: docs/2-3-3 §3-3.",
+    )
+    debug_mode: bool = Field(
+        default=False,
+        description="디버그 모드 — True 시 ExtractedFrame.landmarks_full (33점 전체) 채움. MVP 운영은 False (메모리 절약, 6종만 전달). 출처: docs/2-3-3 §4-1.",
+    )
+
+
+# ============================================================
 # 2-3-4. 자세 지표 산출 (metrics/)
 # ============================================================
 
@@ -622,6 +675,9 @@ class AppConfig(BaseSettings):
     # ── 2-3-2 영상 전처리 + Frame-level 품질 ───────────────
     frame_preprocess: FramePreprocessConfig = Field(default_factory=FramePreprocessConfig)
 
+    # ── 2-3-3 Pose Landmark 추출 ──────────────────────────
+    mediapipe_pose: MediaPipePoseConfig = Field(default_factory=MediaPipePoseConfig)
+
     # ── 2-3-4 자세 지표 산출 ───────────────────────────────
     smoothing: SmoothingConfig = Field(default_factory=SmoothingConfig)
     frame_quality: FrameQualityConfig = Field(default_factory=FrameQualityConfig)
@@ -640,7 +696,7 @@ class AppConfig(BaseSettings):
     variability: MetricVariabilityConfig = Field(default_factory=MetricVariabilityConfig)
     ic_validation: ICValidationConfig = Field(default_factory=ICValidationConfig)
 
-    # ── 2-3-3/6/7 영역 — 해당 docs 확정 후 추가 ────────
+    # ── 2-3-6/7 영역 — 해당 docs 확정 후 추가 ────────
 
 
 app_config = AppConfig()
