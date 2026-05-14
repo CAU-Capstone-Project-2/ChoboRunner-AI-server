@@ -246,15 +246,42 @@ class PoseExtractor:
         )
 
     def _on_result(self, result, output_image, timestamp_ms: int) -> None:
-        """LIVE_STREAM result callback — Phase 2-2b에서 본체 채움.
+        """LIVE_STREAM result callback 본체 (Phase 2-2b).
 
-        현재 Phase 2-2a placeholder. Phase 2-2b에서:
-        - self._pending_timestamps에서 timestamp_ms로 frame_index 조회
-        - self._results[frame_index] = result 저장
-        - threading.Lock으로 thread-safe 보호
-        - 예외 swallow + logger.exception
+        비동기 callback — frame 도착 순서와 다를 수 있음 (docs/2-3-3 §3-5).
+        timestamp_ms 기준으로 `_pending_timestamps`에서 frame_index 조회하여
+        `_results[frame_index]`에 저장.
+
+        Thread safety:
+        - 모든 dict 접근 `self._lock` 보호 (`with` 블록).
+        - callback 예외는 swallow (메인 스레드 영향 0) + `logger.exception`.
+        - pending에 없는 timestamp는 warn (정합 깨짐 신호).
+        - dict 크기 10000 초과 시 warn (메모리 누수 / 호출자 pop 누락 신호).
+
+        Args:
+            result: `mp.tasks.vision.PoseLandmarkerResult` (typing 의존 회피로
+                직접 타입 없음).
+            output_image: `mp.Image` (본 모듈에서 사용 안 함, MediaPipe API
+                시그니처 요구).
+            timestamp_ms: `detect_async` 호출 시 전달한 timestamp.
         """
-        pass
+        try:
+            with self._lock:
+                frame_index = self._pending_timestamps.pop(timestamp_ms, None)
+                if frame_index is None:
+                    logger.warning(
+                        "callback: pending에 없는 timestamp_ms=%d", timestamp_ms
+                    )
+                    return
+                self._results[frame_index] = result
+            # dict 크기 임계 — 메모리 누수 신호 (호출자가 pop 안 함 의심)
+            if len(self._results) > 10000:
+                logger.warning(
+                    "결과 dict 크기 %d, 메모리 누수 가능 — 호출자 pop 누락 확인",
+                    len(self._results),
+                )
+        except Exception:
+            logger.exception("result_callback 예외 (swallow)")
 
 
 # ============================================================
