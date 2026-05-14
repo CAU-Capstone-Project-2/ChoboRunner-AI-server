@@ -196,3 +196,83 @@ def iter_frames(video_path: Path, frame_stride: int = 1) -> Iterator[np.ndarray]
             src_idx += 1
     finally:
         cap.release()
+
+
+# ============================================================
+# Live mode (docs/2-3-2 본 구현) — Phase 2 정규화
+# ============================================================
+
+
+def decode_jpeg_binary(jpeg_bytes: bytes) -> np.ndarray | None:
+    """JPEG binary → BGR `np.ndarray`. 실패 시 None.
+
+    docs/2-3-2 §3-4 디코딩 정책. `decode_failed`는 후속 단계 전달 X (품질 플래그
+    정책의 예외). 호출자(통합 Preprocessor)가 None 시 해당 frame skip.
+
+    빈 bytes / 손상 JPEG 등 invalid input 모두 None 반환 — `cv2.imdecode`가
+    빈 buffer에서 C++ assertion(`!buf.empty()`)을 raise하므로 빈 bytes 체크 +
+    `cv2.error` catch로 안전 처리.
+
+    Args:
+        jpeg_bytes: JPEG 압축 binary.
+
+    Returns:
+        BGR `np.ndarray` (H, W, 3) or None (decode 실패).
+    """
+    if not jpeg_bytes:
+        return None
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    try:
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except cv2.error:
+        return None
+    return img  # None if decode failed
+
+
+def normalize_resolution(
+    frame: np.ndarray, long_side_cap: int = 1280
+) -> np.ndarray:
+    """긴 변 cap downsample (docs/2-3-2 §3-2).
+
+    `INTER_AREA` 보간. 미만은 업스케일 X (원본 유지) — 미만 입력은 2-3-1의
+    `low_resolution` failed로 별도 처리.
+
+    Args:
+        frame: BGR `np.ndarray` (H, W, 3).
+        long_side_cap: 긴 변 상한 (픽셀, default 1280 = 720p).
+
+    Returns:
+        cap 적용 후 frame. 원본보다 작거나 같음.
+    """
+    h, w = frame.shape[:2]
+    long_side = max(h, w)
+    if long_side <= long_side_cap:
+        return frame  # 업스케일 X
+    scale = long_side_cap / long_side
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def should_select_frame_for_fps_grid(
+    capture_ts: float,
+    last_selected_ts: float | None,
+    fps_cap: float = 30.0,
+) -> bool:
+    """30fps grid 최근접 채택 결정 (docs/2-3-2 §3-1). Stateless.
+
+    30fps 초과(60fps/50fps/45fps) → grid에 맞춰 frame skip.
+    30fps 미만(24fps 등) → 보간 X, 모든 frame 채택 (state로 알아서 보장).
+
+    Args:
+        capture_ts: 현재 frame capture timestamp (초).
+        last_selected_ts: 직전 채택 frame의 capture timestamp. None이면 첫 frame.
+        fps_cap: 목표 fps 상한 (default 30).
+
+    Returns:
+        True면 채택, False면 skip.
+    """
+    if last_selected_ts is None:
+        return True  # 첫 frame 항상 채택
+    grid_interval = 1.0 / fps_cap  # 30fps → 33.3ms
+    return (capture_ts - last_selected_ts) >= grid_interval
