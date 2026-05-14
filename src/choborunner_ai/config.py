@@ -30,6 +30,8 @@
   tasks. Front Bioeng Biotechnol, 10, 868928.
 """
 
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -175,6 +177,10 @@ class MediaPipePoseConfig(BaseModel):
     model_name: str = Field(
         default="full",
         description="Pose Landmarker 모델 — 'full' (정확도 우선, 33 landmark) 또는 'lite' (~50% 빠름, 정확도 trade-off). ⚠️ 데모 영상 파일럿 후 확정. 출처: docs/2-3-3 §3-2.",
+    )
+    model_path: Path = Field(
+        default=Path("assets/models/pose_landmarker_lite.task"),
+        description="MediaPipe Pose Landmarker .task 모델 경로. docs/2-3-3 §3-2 '파일럿 후 확정' 정책에 따라 lite로 시작 — full 모델은 Day 7~8 파일럿 후 추가·전환 결정. 향후 env var CHOBO_MEDIAPIPE_POSE__MODEL_PATH로 override 가능.",
     )
     num_poses: int = Field(
         default=1,
