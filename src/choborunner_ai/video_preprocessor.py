@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Literal
@@ -276,3 +277,75 @@ def should_select_frame_for_fps_grid(
         return True  # 첫 frame 항상 채택
     grid_interval = 1.0 / fps_cap  # 30fps → 33.3ms
     return (capture_ts - last_selected_ts) >= grid_interval
+
+
+# ============================================================
+# Live mode — Phase 3 timestamp + sliding window fps tracker
+# ============================================================
+
+
+class FpsTracker:
+    """Sliding window 기반 fps 추정 (docs/2-3-2 §6).
+
+    `fps_actual_recent` = 최근 N frame 인접 timestamp 간격 평균의 역수.
+    매 frame 갱신. 본 클래스는 본 모듈의 **첫 stateful 컴포넌트**이며, 통합
+    Preprocessor (Phase 5)가 인스턴스를 보관하고 매 frame `add()` 호출 후
+    `fps_recent`를 ProcessedFrame에 첨부한다.
+
+    빈/1개 timestamp 상태: 0.0 반환 (호출자가 fps_cap fallback 결정).
+    인접 timestamp 모두 동일(`total_interval <= 0`): 0.0 반환 (zero-division
+    방어).
+    """
+
+    def __init__(self, window: int = 30) -> None:
+        """sliding window 크기 설정 (default 30 = docs/2-3-2 §6).
+
+        Args:
+            window: 최근 N frame timestamp 보관. deque maxlen으로 자동 truncate.
+        """
+        self._timestamps: deque[float] = deque(maxlen=window)
+
+    def add(self, timestamp_sec: float) -> None:
+        """timestamp 추가. window 초과 시 가장 오래된 항목 자동 제거."""
+        self._timestamps.append(timestamp_sec)
+
+    @property
+    def fps_recent(self) -> float:
+        """최근 fps 추정 (Hz). 2개 미만 또는 zero-interval 시 0.0."""
+        n = len(self._timestamps)
+        if n < 2:
+            return 0.0
+        # 인접 간격 평균 = (last - first) / (n - 1)
+        total_interval = self._timestamps[-1] - self._timestamps[0]
+        if total_interval <= 0:
+            return 0.0
+        mean_interval = total_interval / (n - 1)
+        return 1.0 / mean_interval
+
+    @property
+    def size(self) -> int:
+        """현재 window에 있는 timestamp 개수 (0 ~ window)."""
+        return len(self._timestamps)
+
+
+def resolve_timestamp(
+    capture_ts: float | None,
+    server_recv_ts: float,
+) -> tuple[float, bool]:
+    """capture timestamp 우선, 누락 시 server 수신 시각으로 fallback.
+
+    docs/2-3-2 §3-3: Android `SystemClock.elapsedRealtimeNanos()` 기반
+    capture_ts가 정상 경로. None이면 AI 서버 수신 시각 사용 + fallback 플래그.
+    호출자(통합 Preprocessor)가 is_fallback True 시 `quality_flags`에
+    `"timestamp_fallback"` 추가.
+
+    Args:
+        capture_ts: Android capture timestamp (초). None이면 fallback.
+        server_recv_ts: AI 서버 수신 시각 (초).
+
+    Returns:
+        (timestamp_sec, is_fallback) — 사용할 timestamp + fallback 사용 여부.
+    """
+    if capture_ts is None:
+        return (server_recv_ts, True)
+    return (capture_ts, False)

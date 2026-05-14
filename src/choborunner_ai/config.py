@@ -148,6 +148,12 @@ class FramePreprocessConfig(BaseModel):
         gt=0.0,
         description="인접 frame SSD 변화량의 평균 대비 임계 비율 (×200%). 초과 시 'frame_unstable' 플래그. ⚠️ 러닝 자체 움직임 오탐 위험 (docs/2-3-2 §4-3). 파일럿 보정.",
     )
+    timestamp_fallback_ratio_max: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="누적 'timestamp_fallback' frame 비율 임계. 초과 시 2-3-5에 신호 전달 (시간 정확도 저하). Phase 5 통합 Preprocessor가 누적 비율 계산, 본 단계는 플래그만 부여. 출처: docs/2-3-2 §3-3.",
+    )
 
 
 # ============================================================
