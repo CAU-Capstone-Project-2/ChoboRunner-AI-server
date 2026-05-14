@@ -1,17 +1,20 @@
 """MediaPipe Tasks Pose Landmarker — frame별 랜드마크 추출.
 
-본 모듈은 두 path를 지원한다 (호환 모드 A — Phase 1 토대 단계):
+본 모듈은 두 path를 지원한다 (호환 모드 A):
 
-**Live path (docs/2-3-3 본 구현, Phase 2~5에서 점진 구현)**:
+**Live path (docs/2-3-3 본 구현)**:
 - ProcessedFrame 입력 (2-3-2 video_preprocessor 출력).
 - 출력: ExtractedFrame (ProcessedFrame + PoseLandmarks 6종 + pose_quality_flags).
-- MediaPipe Pose Tasks API, Live stream mode 운영 / Video mode 검증·실험 (§3-3).
+- MediaPipe Pose Tasks API, **LIVE_STREAM mode** 운영 (§3-3).
+- 비동기 callback 기반 — `detect_async` + `result_callback`. callback 순서가
+  frame 도착 순서와 다를 수 있으므로 `dict[frame_index]` 보관 + thread-safe.
 - 6 landmark 종 (좌우 12점) — shoulder/hip/knee/ankle/heel/foot_index (§4-1).
 - 디버그 모드 시 33 landmark 전체 보존 (`landmarks_full`).
-- 본 Phase 1은 dataclass + Literal 토대만. PoseExtractor stateful class는 Phase 2.
+- Phase 1: dataclass + Literal 토대 / Phase 2-2a: __init__ + 모델 로딩 /
+  Phase 2-2b: result_callback 본체 / Phase 2-2c: process_frame 동기 wrapper.
 
 **File path (demo path, Vertical Slice 임시)**:
-- Iterable[np.ndarray] 입력. MediaPipe 단발 호출.
+- Iterable[np.ndarray] 입력. MediaPipe 단발 호출 (VIDEO mode).
 - 출력: list[FramePose] (33×4 numpy).
 - 함수: `extract_poses_from_frames`.
 - 본 함수는 demo_trunk.py 호환 + Vertical Slice 회의 자산 보존 목적.
@@ -28,6 +31,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal, Optional
@@ -36,6 +41,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from choborunner_ai.config import MediaPipePoseConfig
 from choborunner_ai.video_preprocessor import ProcessedFrame
 
 logger = logging.getLogger(__name__)
@@ -156,6 +162,99 @@ class ExtractedFrame:
     landmarks_full: Optional[np.ndarray] = None
     pose_quality_flags: list[PoseQualityFlag] = field(default_factory=list)
     frame_index: int = 0
+
+
+# ============================================================
+# Live path — Phase 2-2a PoseExtractor __init__ + 모델 로딩
+# ============================================================
+
+
+class PoseExtractor:
+    """MediaPipe Pose Landmarker LIVE_STREAM mode wrapper (docs/2-3-3).
+
+    Live stream mode 비동기 callback 기반 — `detect_async()` + `result_callback`
+    패턴. callback이 도착하는 순서가 frame 도착 순서와 다를 수 있으므로
+    (docs/2-3-3 §3-5), `self._results dict[frame_index]` 보관 + `threading.Lock`
+    으로 thread-safe 처리.
+
+    Stateful — 모델 인스턴스를 `__init__`에서 한 번만 로딩 후 재사용. 매 frame
+    초기화 반복 X (legacy file path의 함수 호출 패턴과 대비).
+
+    Phase 단계:
+    - Phase 2-2a (본 단계): `__init__` + LIVE_STREAM options + 모델 로딩
+    - Phase 2-2b: `_on_result` 본체 (callback 시 dict 갱신, thread safety)
+    - Phase 2-2c: `process_frame` 동기 wrapper (detect_async + polling)
+    """
+
+    def __init__(self, cfg: MediaPipePoseConfig) -> None:
+        """LIVE_STREAM mode landmarker 초기화.
+
+        Args:
+            cfg: MediaPipePoseConfig (DI). model_path / num_poses /
+                min_*_confidence / output_segmentation_masks 사용.
+
+        Raises:
+            FileNotFoundError: `cfg.model_path` 파일 부재.
+            RuntimeError: `PoseLandmarker.create_from_options` 실패.
+        """
+        if not cfg.model_path.is_file():
+            raise FileNotFoundError(
+                f"Pose Landmarker 모델 파일이 없음: {cfg.model_path.resolve()}\n"
+                f"  assets/models/ 경로 확인. cfg.model_path={cfg.model_path}"
+            )
+
+        self._cfg = cfg
+        # frame_index → PoseLandmarkerResult (callback에서 채움)
+        self._results: dict[int, object] = {}
+        # timestamp_ms → frame_index (process_frame에서 등록, callback에서 pop)
+        self._pending_timestamps: dict[int, int] = {}
+        self._lock = threading.Lock()
+        self._last_timestamp_ms: int = -1
+        self._printed_first_result: bool = False
+
+        # MediaPipe LIVE_STREAM options 구성
+        BaseOptions = mp.tasks.BaseOptions
+        PoseLandmarker = mp.tasks.vision.PoseLandmarker
+        PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+        RunningMode = mp.tasks.vision.RunningMode
+
+        options = PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(cfg.model_path.resolve())),
+            running_mode=RunningMode.LIVE_STREAM,
+            num_poses=cfg.num_poses,
+            min_pose_detection_confidence=cfg.min_pose_detection_confidence,
+            min_pose_presence_confidence=cfg.min_pose_presence_confidence,
+            min_tracking_confidence=cfg.min_tracking_confidence,
+            output_segmentation_masks=cfg.output_segmentation_masks,
+            result_callback=self._on_result,
+        )
+
+        load_start = time.perf_counter()
+        try:
+            self._landmarker = PoseLandmarker.create_from_options(options)
+        except Exception as e:
+            raise RuntimeError(
+                f"PoseLandmarker.create_from_options 실패: "
+                f"cfg.model_path={cfg.model_path}, cause: {e}"
+            ) from e
+        load_elapsed_ms = (time.perf_counter() - load_start) * 1000.0
+        logger.info(
+            "PoseExtractor 초기화 완료 — model=%s (%.1f KB), 로딩 %.1f ms",
+            cfg.model_path.name,
+            cfg.model_path.stat().st_size / 1024,
+            load_elapsed_ms,
+        )
+
+    def _on_result(self, result, output_image, timestamp_ms: int) -> None:
+        """LIVE_STREAM result callback — Phase 2-2b에서 본체 채움.
+
+        현재 Phase 2-2a placeholder. Phase 2-2b에서:
+        - self._pending_timestamps에서 timestamp_ms로 frame_index 조회
+        - self._results[frame_index] = result 저장
+        - threading.Lock으로 thread-safe 보호
+        - 예외 swallow + logger.exception
+        """
+        pass
 
 
 # ============================================================
