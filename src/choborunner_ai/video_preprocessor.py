@@ -7,7 +7,7 @@
   품질 검사).
 - 입력 형식: bytes (JPEG) + capture_timestamp_ns.
 - 출력: `ProcessedFrame`.
-- Phase 2~5에서 점진 구현 예정. 본 Phase 1은 토대 (dataclass + Literal)만.
+- 통합 진입점: `Preprocessor` class (Phase 5).
 
 **File mode (demo path, Vertical Slice 임시)**:
 - 영상 파일 경로 입력. OpenCV `VideoCapture` 기반.
@@ -37,6 +37,8 @@ from typing import Iterator, Literal
 
 import cv2
 import numpy as np
+
+from choborunner_ai.config import FramePreprocessConfig
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +267,11 @@ def should_select_frame_for_fps_grid(
     30fps 초과(60fps/50fps/45fps) → grid에 맞춰 frame skip.
     30fps 미만(24fps 등) → 보간 X, 모든 frame 채택 (state로 알아서 보장).
 
+    Float ULP 오차 방어를 위해 1e-9 tolerance 적용 (Phase 5 sanity 6 발견).
+    Android `SystemClock.elapsedRealtimeNanos()` → sec 변환 시 발생하는 누적
+    오차 흡수. ms 단위 정확도(1e-3) 대비 1e-9는 무시 가능 — 30fps 경계
+    34ms·20ms 판정에도 영향 없음.
+
     Args:
         capture_ts: 현재 frame capture timestamp (초).
         last_selected_ts: 직전 채택 frame의 capture timestamp. None이면 첫 frame.
@@ -275,8 +282,9 @@ def should_select_frame_for_fps_grid(
     """
     if last_selected_ts is None:
         return True  # 첫 frame 항상 채택
+    EPS = 1e-9
     grid_interval = 1.0 / fps_cap  # 30fps → 33.3ms
-    return (capture_ts - last_selected_ts) >= grid_interval
+    return (capture_ts - last_selected_ts) >= (grid_interval - EPS)
 
 
 # ============================================================
@@ -315,7 +323,6 @@ class FpsTracker:
         n = len(self._timestamps)
         if n < 2:
             return 0.0
-        # 인접 간격 평균 = (last - first) / (n - 1)
         total_interval = self._timestamps[-1] - self._timestamps[0]
         if total_interval <= 0:
             return 0.0
@@ -436,3 +443,152 @@ def check_frame_stability(
     if ssd_baseline <= 0:
         return False
     return (ssd / ssd_baseline) > ssd_change_ratio_max
+
+
+# ============================================================
+# Live mode — Phase 5 통합 Preprocessor (stateful)
+# ============================================================
+
+
+class Preprocessor:
+    """docs/2-3-2 live mode 통합 처리 (Phase 5).
+
+    매 frame: decode → resolve_ts → fps grid → resize → 품질 3종 → ProcessedFrame.
+
+    상태 5개 보관:
+    - `FpsTracker` (timestamp deque, sliding window fps)
+    - `_prev_frame` (stability 비교용)
+    - `_ssd_history` deque (baseline 누적)
+    - `_last_selected_ts` (fps grid 결정용)
+    - fallback/total counter (`fallback_ratio` 추적, docs/2-3-2 §3-3)
+
+    SSD baseline 정책 (Phase 4 메모 반영):
+    1. 첫 frame: `_prev_frame` None → check_frame_stability False
+    2. 두 번째~: `_ssd_history` 비어있거나 미확정 → False, history는 stable 시에만 push
+    3. unstable 판정 시 baseline 갱신 X (오탐 자기 강화 방지)
+
+    decode 실패와 fps grid skip은 counter 갱신 X (frame 자체가 채택 안 됨).
+    """
+
+    def __init__(
+        self,
+        cfg: FramePreprocessConfig,
+        ssd_window: int = 30,
+    ) -> None:
+        """초기화. cfg는 외부 주입(DI), ssd_window는 baseline 누적 window 크기.
+
+        Args:
+            cfg: 임계값·grid 설정 (docs/2-3-2 매핑).
+            ssd_window: SSD baseline 누적 deque maxlen (default 30 = fps_tracker
+                와 동일 단위).
+        """
+        self._cfg = cfg
+        self._fps_tracker = FpsTracker(window=cfg.fps_tracker_window)
+        self._prev_frame: np.ndarray | None = None
+        self._ssd_history: deque[float] = deque(maxlen=ssd_window)
+        self._last_selected_ts: float | None = None
+        self._frame_counter: int = 0
+        self._fallback_counter: int = 0
+        self._total_counter: int = 0
+
+    @staticmethod
+    def _compute_ssd(a: np.ndarray, b: np.ndarray) -> float:
+        """두 frame의 SSD. `astype(float64)`로 오버플로 방어 (Phase 4 패턴 동일).
+
+        check_frame_stability 안에서 한 번 더 SSD 계산되지만 (baseline 비교용),
+        본 함수는 baseline 갱신용 push 전용. 코드 중복 허용 — Preprocessor 본 구현의
+        단순성·테스트 용이성 우선. 성능 영향은 frame당 ~1ms 미만 (720p 기준).
+        """
+        diff = a.astype(np.float64) - b.astype(np.float64)
+        return float(np.sum(diff * diff))
+
+    def preprocess_frame(
+        self,
+        jpeg_bytes: bytes,
+        capture_ts: float | None,
+        server_recv_ts: float,
+    ) -> ProcessedFrame | None:
+        """live mode 단일 frame 처리. ProcessedFrame 또는 None.
+
+        반환 None 케이스 (counter 갱신 X):
+        - decode 실패 (docs/2-3-2 §3-4 후속 단계 전달 X)
+        - fps grid skip (60fps 입력에서 매 두 번째 frame 등, docs/2-3-2 §3-1)
+
+        Args:
+            jpeg_bytes: WebSocket binary frame (JPEG).
+            capture_ts: Android capture timestamp (초). None이면 fallback.
+            server_recv_ts: AI 서버 수신 시각 (초).
+
+        Returns:
+            채택 시 ProcessedFrame, skip 시 None.
+        """
+        # 1. decode
+        img = decode_jpeg_binary(jpeg_bytes)
+        if img is None:
+            return None
+
+        # 2. resolve timestamp
+        timestamp_sec, is_fallback = resolve_timestamp(capture_ts, server_recv_ts)
+
+        # 3. fps grid 판정
+        if not should_select_frame_for_fps_grid(
+            timestamp_sec, self._last_selected_ts, self._cfg.fps_cap
+        ):
+            return None
+
+        # 4. resize (cap downsample, 미만 원본 유지)
+        img = normalize_resolution(img, self._cfg.resolution_long_side_cap)
+
+        # 5. quality flags 결정
+        quality_flags: list[QualityFlag] = []
+        if is_fallback:
+            quality_flags.append("timestamp_fallback")
+        if check_brightness(img, self._cfg.brightness_min):
+            quality_flags.append("low_brightness")
+        if check_motion_blur(img, self._cfg.laplacian_var_min):
+            quality_flags.append("motion_blur")
+
+        # baseline 계산 (warmup: 첫 frame history 비어있으면 None)
+        baseline: float | None = None
+        if len(self._ssd_history) >= 1:
+            baseline = sum(self._ssd_history) / len(self._ssd_history)
+
+        is_unstable = check_frame_stability(
+            img, self._prev_frame, self._cfg.ssd_change_ratio_max, baseline
+        )
+        if is_unstable:
+            quality_flags.append("frame_unstable")
+        else:
+            # unstable 아니면 baseline 갱신 (오탐 자기 강화 방지)
+            if self._prev_frame is not None:
+                ssd = self._compute_ssd(img, self._prev_frame)
+                self._ssd_history.append(ssd)
+
+        # 6. state 갱신
+        self._fps_tracker.add(timestamp_sec)
+        self._prev_frame = img
+        self._last_selected_ts = timestamp_sec
+        self._frame_counter += 1
+        self._total_counter += 1
+        if is_fallback:
+            self._fallback_counter += 1
+
+        # 7. ProcessedFrame 생성
+        return ProcessedFrame(
+            frame_index=self._frame_counter - 1,
+            timestamp_sec=timestamp_sec,
+            image=img,
+            quality_flags=quality_flags,
+            fps_actual_recent=self._fps_tracker.fps_recent,
+        )
+
+    @property
+    def fallback_ratio(self) -> float:
+        """누적 fallback 비율 (docs/2-3-2 §3-3).
+
+        `FramePreprocessConfig.timestamp_fallback_ratio_max` (default 0.3) 초과
+        시 2-3-5에 신호 전달 (호출자 책임). 0 frame 시 0.0 반환.
+        """
+        if self._total_counter == 0:
+            return 0.0
+        return self._fallback_counter / self._total_counter
