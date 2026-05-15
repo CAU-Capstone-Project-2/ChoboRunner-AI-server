@@ -11,7 +11,8 @@
 - 6 landmark 종 (좌우 12점) — shoulder/hip/knee/ankle/heel/foot_index (§4-1).
 - 디버그 모드 시 33 landmark 전체 보존 (`landmarks_full`).
 - Phase 1: dataclass + Literal 토대 / Phase 2-2a: __init__ + 모델 로딩 /
-  Phase 2-2b: result_callback 본체 / Phase 2-2c: process_frame 동기 wrapper.
+  Phase 2-2b: result_callback 본체 / Phase 2-2c-1: process_frame 골격
+  (detect_async + polling) / Phase 2-2c-2: result → PoseLandmarks 변환.
 
 **File path (demo path, Vertical Slice 임시)**:
 - Iterable[np.ndarray] 입력. MediaPipe 단발 호출 (VIDEO mode).
@@ -181,9 +182,10 @@ class PoseExtractor:
     초기화 반복 X (legacy file path의 함수 호출 패턴과 대비).
 
     Phase 단계:
-    - Phase 2-2a (본 단계): `__init__` + LIVE_STREAM options + 모델 로딩
+    - Phase 2-2a: `__init__` + LIVE_STREAM options + 모델 로딩
     - Phase 2-2b: `_on_result` 본체 (callback 시 dict 갱신, thread safety)
-    - Phase 2-2c: `process_frame` 동기 wrapper (detect_async + polling)
+    - Phase 2-2c-1 (본 단계): `process_frame` 골격 — detect_async + polling
+    - Phase 2-2c-2: result → `PoseLandmarks` 변환 (다음 commit)
     """
 
     def __init__(self, cfg: MediaPipePoseConfig) -> None:
@@ -282,6 +284,65 @@ class PoseExtractor:
                 )
         except Exception:
             logger.exception("result_callback 예외 (swallow)")
+
+    def process_frame(
+        self, frame: np.ndarray, timestamp_ms: int
+    ) -> object | None:
+        """동기 wrapper — detect_async 호출 + result polling (Phase 2-2c-1).
+
+        호출자 입장 "frame 입력 → 결과 반환" 동기 인터페이스. 내부적으로
+        비동기 callback 결과를 lock 보호된 dict에서 polling.
+
+        timestamp_ms 정책: 호출자가 부여 (PoseExtractor는 시간 정책 미보유).
+        monotonic increasing + 세션 내 unique 보장은 호출자 책임 (MediaPipe
+        LIVE_STREAM 요구). 본 메서드는 timestamp_ms를 frame_index로도 사용
+        (identity 매핑) — 별도 frame_index 인자가 필요해지면 시그니처 확장.
+
+        Args:
+            frame: BGR np.ndarray (video_preprocessor 출력 형식 가정).
+            timestamp_ms: 호출자가 부여한 단조 증가 timestamp (ms).
+
+        Returns:
+            `mp.tasks.vision.PoseLandmarkerResult` (변환 전 raw) 또는 None
+            (timeout 초과). 타입은 mediapipe typing 의존 회피로 `object`.
+            변환 (→ PoseLandmarks 6종)은 Phase 2-2c-2.
+
+        Notes:
+            - polling 간격 `cfg.polling_interval_sec` (기본 1ms): busy loop
+              회피 + GIL 환경 callback thread에 양보. 정당화 상세는 config
+              필드 description.
+            - timeout 초과 시 `_pending_timestamps` 정리 안 함 — 늦게 도착한
+              callback이 `_results`에 쌓이는 것은 `_on_result`의 dict 크기
+              가드(10000)가 차단. 호출자는 None 받고 frame skip 결정.
+        """
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if not rgb.flags["C_CONTIGUOUS"]:
+            rgb = np.ascontiguousarray(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        frame_index = timestamp_ms  # identity 매핑 (호출자 monotonic 보장 가정)
+        with self._lock:
+            self._pending_timestamps[timestamp_ms] = frame_index
+        self._landmarker.detect_async(mp_image, timestamp_ms)
+
+        timeout_sec = self._cfg.frame_timeout_sec
+        poll_start = time.perf_counter()
+        while True:
+            with self._lock:
+                result = self._results.pop(frame_index, None)
+            if result is not None:
+                return result
+            elapsed = time.perf_counter() - poll_start
+            if elapsed >= timeout_sec:
+                logger.warning(
+                    "process_frame timeout — timestamp_ms=%d, %.3fs 초과 "
+                    "(cfg.frame_timeout_sec=%.3fs)",
+                    timestamp_ms,
+                    elapsed,
+                    timeout_sec,
+                )
+                return None
+            time.sleep(self._cfg.polling_interval_sec)
 
 
 # ============================================================

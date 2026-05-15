@@ -213,6 +213,16 @@ class MediaPipePoseConfig(BaseModel):
         default=False,
         description="디버그 모드 — True 시 ExtractedFrame.landmarks_full (33점 전체) 채움. MVP 운영은 False (메모리 절약, 6종만 전달). 출처: docs/2-3-3 §4-1.",
     )
+    frame_timeout_sec: float = Field(
+        default=0.5,
+        gt=0.0,
+        description="process_frame polling timeout (초). detect_async 비동기 callback 도착을 본 시간 동안 대기, exceeded 시 None 반환 + logger.warning. 30fps 기준 약 15 frame 분량. 운영 환경 latency 파일럿 후 보정 가능.",
+    )
+    polling_interval_sec: float = Field(
+        default=0.001,
+        gt=0.0,
+        description="detect_async callback polling 간격 (초). busy loop 회피용 OS thread yield. 기본 1ms는 callback thread starvation 회피 + latency 최소화 균형값.",
+    )
 
 
 # ============================================================
