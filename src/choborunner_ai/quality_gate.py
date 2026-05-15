@@ -7,8 +7,8 @@ docs/2-3-5 §1 단일 정답 3가지 중 본 Phase 4 scope:
 - [X] Reason code 우선순위·사용자 메시지 §8-7 — 별도 Phase
 
 Phase 4 작업 단위:
-- Phase 4-A (본 단계): Literal[ReasonCode] + FrameVisibilityResult + evaluate_frame_visibility
-- Phase 4-B: evaluate_visibility_accumulation (docs §5-1 5번 유효 frame 비율)
+- Phase 4-A: Literal[ReasonCode] + FrameVisibilityResult + evaluate_frame_visibility
+- Phase 4-B (본 단계): evaluate_visibility_accumulation (docs §5-1 5번 유효 frame 비율)
 - Phase 4-C: 통합 sanity end-to-end (scripts/sanity/)
 
 PoseQualityFlag (pose_extractor.py) vs ReasonCode (본 모듈) 분리 (Day 5 decision 6):
@@ -17,6 +17,12 @@ PoseQualityFlag (pose_extractor.py) vs ReasonCode (본 모듈) 분리 (Day 5 dec
 - ReasonCode: docs §8 SoT — 사용자 메시지 매핑 (예 'low_landmark_visibility').
   본 quality_gate 부여 + 응답 메시지(2-3-7)로 전달.
 - 두 Literal 이름 충돌 X, 의미 겹침은 있지만 책임 분리 유지.
+
+"유효 frame" 정의 분리 (Day 5 decision 7):
+- 본 모듈 §5-1 5번 한정: FrameVisibilityResult.is_valid=True (4 카테고리 모두 통과).
+- docs §3-1 정의(분석측 5 landmark 평균 임계 통과)와 다름 — §3-1 정의는
+  분석측 결정 정책 범위, §5-1까지 확장은 docs 명시 X.
+- 향후 §3-1 진입 Phase에서 별도 함수로 분리 예정.
 """
 from __future__ import annotations
 
@@ -225,3 +231,53 @@ def evaluate_frame_visibility(
             ],
             is_valid=False,
         )
+
+
+# ============================================================
+# 누적 visibility 평가 (docs §5-1 5번 유효 frame 비율)
+# ============================================================
+
+
+def evaluate_visibility_accumulation(
+    results: list[FrameVisibilityResult],
+    cfg: VisibilityCheckConfig,
+) -> list[ReasonCode]:
+    """누적 평가 — 유효 frame 비율 (docs/2-3-5 §5-1 5번).
+
+    유효 frame 정의: `FrameVisibilityResult.is_valid=True` (4 카테고리 모두
+    통과). docs §3-1의 "유효 frame" 정의(분석측 5 landmark 평균 임계 통과)와
+    다름 — 본 모듈 §5-1 5번 한정 정의 (Phase 4 decision 7).
+
+    모집단: 입력 list 전체. 빈 list → 빈 list 반환 (모듈 경계, decision 5:
+    frame 부족은 docs/2-3-1 `too_short` trigger 책임, 본 모듈 책임 외).
+
+    Args:
+        results: list[FrameVisibilityResult] (Phase 4-A 출력 누적).
+        cfg: VisibilityCheckConfig. `valid_frame_ratio_min` 사용 (default 0.6).
+
+    Returns:
+        list[ReasonCode]:
+        - 유효 비율 ≥ `valid_frame_ratio_min` 또는 빈 입력 → `[]`
+        - 유효 비율 < `valid_frame_ratio_min` → `["low_landmark_visibility"]`
+        단일 코드라도 list 형식 유지 (호출자 일관성, 향후 §5-2~5-7 누적 함수
+        확장 시 동일 시그니처).
+
+    견고성 가드:
+    - 빈 list → `[]` (zero division 가드, 모듈 경계).
+    - 평가 예외 → `logger.exception` + `["low_landmark_visibility"]` failed-safe
+      ("평가 못 함" 시그널, 메인 분석 흐름 보호).
+    """
+    try:
+        if not results:
+            return []
+        valid_count = sum(1 for r in results if r.is_valid)
+        ratio = valid_count / len(results)
+        if ratio < cfg.valid_frame_ratio_min:
+            return ["low_landmark_visibility"]
+        return []
+    except Exception:
+        logger.exception(
+            "evaluate_visibility_accumulation 예외 "
+            "(swallow, low_landmark_visibility 반환)"
+        )
+        return ["low_landmark_visibility"]
