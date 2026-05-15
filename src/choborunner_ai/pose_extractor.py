@@ -4,15 +4,18 @@
 
 **Live path (docs/2-3-3 본 구현)**:
 - ProcessedFrame 입력 (2-3-2 video_preprocessor 출력).
-- 출력: ExtractedFrame (ProcessedFrame + PoseLandmarks 6종 + pose_quality_flags).
+- **process_frame 반환은 `PoseLandmarks | None` 단독**. ExtractedFrame
+  조립(ProcessedFrame + PoseLandmarks + flags)은 호출자(pipeline.py) 책임 —
+  모듈 경계 분리.
 - MediaPipe Pose Tasks API, **LIVE_STREAM mode** 운영 (§3-3).
 - 비동기 callback 기반 — `detect_async` + `result_callback`. callback 순서가
   frame 도착 순서와 다를 수 있으므로 `dict[frame_index]` 보관 + thread-safe.
 - 6 landmark 종 (좌우 12점) — shoulder/hip/knee/ankle/heel/foot_index (§4-1).
-- 디버그 모드 시 33 landmark 전체 보존 (`landmarks_full`).
+- 디버그 모드 시 33 landmark 전체 보존 (`PoseLandmarks.landmarks_full`).
 - Phase 1: dataclass + Literal 토대 / Phase 2-2a: __init__ + 모델 로딩 /
   Phase 2-2b: result_callback 본체 / Phase 2-2c-1: process_frame 골격
-  (detect_async + polling) / Phase 2-2c-2: result → PoseLandmarks 변환.
+  (detect_async + polling) / Phase 2-2c-2: _convert_result + process_frame
+  변환 통합 (PoseLandmarks | None 반환).
 
 **File path (demo path, Vertical Slice 임시)**:
 - Iterable[np.ndarray] 입력. MediaPipe 단발 호출 (VIDEO mode).
@@ -95,9 +98,13 @@ class LandmarkPair:
         return np.stack([self.left.to_numpy(), self.right.to_numpy()], axis=0)
 
 
-@dataclass
+@dataclass(eq=False)
 class PoseLandmarks:
-    """운영 모드 6종 landmark — docs/2-3-3 §4-1.
+    """운영 모드 6종 landmark + 디버그 모드 33점 raw — docs/2-3-3 §4-1.
+
+    `eq=False` 이유: `landmarks_full` 필드가 `np.ndarray`라 dataclass 자동
+    `__eq__`가 element-wise 비교를 생성해 bool ambiguous error 발생
+    (ExtractedFrame과 동일 사유).
 
     자세 지표 계산에 필요한 6종만 후속 단계로 전달:
     - shoulder: Trunk Lean
@@ -107,7 +114,17 @@ class PoseLandmarks:
     - heel: Foot Strike Pattern, IC 검출
     - foot_index: Foot Strike Pattern, IC 검출
 
-    `to_numpy()` 반환: (12, 3) — 6 종 × 2 (좌/우) × 3 (x, y, vis).
+    Attributes:
+        shoulder/hip/knee/ankle/heel/foot_index: 6종 LandmarkPair (좌/우).
+            각 Landmark는 (x, y, visibility) 3필드 — docs §3-4 normalized
+            좌표 정책 (z 미사용).
+        landmarks_full: 디버그 모드 raw 33점 `np.ndarray (33, 4)` [x, y, z,
+            visibility]. `MediaPipePoseConfig.debug_mode=True`일 때만 채움,
+            그 외 None (§4-1 메모리 절약). **z는 디버그 raw 자산만** — 운영
+            6종은 z 미보존.
+
+    `to_numpy()` 반환: (12, 3) — 6 종 × 2 (좌/우) × 3 (x, y, vis). landmarks_full
+    포함 안 함 (디버그 자산 분리).
     행 순서: shoulder L/R, hip L/R, knee L/R, ankle L/R, heel L/R, foot_index L/R.
     """
 
@@ -117,9 +134,10 @@ class PoseLandmarks:
     ankle: LandmarkPair
     heel: LandmarkPair
     foot_index: LandmarkPair
+    landmarks_full: Optional[np.ndarray] = None
 
     def to_numpy(self) -> np.ndarray:
-        """(12, 3) np.ndarray — 6 pair × 2 (L/R) × 3 (x, y, vis)."""
+        """(12, 3) np.ndarray — 6 pair × 2 (L/R) × 3 (x, y, vis). landmarks_full 미포함."""
         return np.concatenate(
             [
                 self.shoulder.to_numpy(),
@@ -135,13 +153,17 @@ class PoseLandmarks:
 
 @dataclass(eq=False)
 class ExtractedFrame:
-    """Pose 추출 결과 (docs/2-3-3 §4 출력 구조).
+    """Pose 추출 + frame 메타 합성 — pipeline.py 조립 단위 (docs/2-3-3 §4 출력 구조).
 
-    `eq=False` 이유: `landmarks_full` 필드가 `np.ndarray`라 dataclass 자동
-    `__eq__`가 element-wise 비교를 생성해 bool ambiguous error 발생.
+    `eq=False` 이유: `landmarks` 내부 `landmarks_full` 필드가 `np.ndarray`라
+    dataclass 자동 `__eq__`가 element-wise 비교를 생성해 bool ambiguous error 발생.
 
     Live stream mode callback 순서 보장 X — `frame_index` + `timestamp_sec`
     둘 다 보존하여 후속 모듈이 정렬 가능 (§3-5).
+
+    조립 위치: `PoseExtractor.process_frame`은 `PoseLandmarks` 단독 반환,
+    `pipeline.py`가 ProcessedFrame + flags를 합쳐 본 dataclass로 조립. 본
+    모듈은 정의만 제공.
 
     Attributes:
         processed_frame: 2-3-2 ProcessedFrame 통째 보존 (image, frame_quality_flags,
@@ -149,9 +171,8 @@ class ExtractedFrame:
             본 `pose_quality_flags`와 분리.
         pose_detected: MediaPipe 추출 성공 여부 (§4-2).
         landmarks: 6종 PoseLandmarks (운영 모드). pose_detected=False면 None.
-        landmarks_full: 33점 전체 `np.ndarray (33, 4)` [x, y, z, visibility].
-            `MediaPipePoseConfig.debug_mode=True`일 때만 채움, 그 외 None
-            (§4-1 메모리 절약).
+            `landmarks_full` (디버그 raw 33점)은 `PoseLandmarks` 내부에 보관 —
+            본 dataclass는 별도 필드 미보유.
         pose_quality_flags: pose 단계 품질 신호. video_preprocessor의 frame-level
             플래그와 분리.
         frame_index: 도착 순서 (callback 순서 보장 X 대비, §3-5).
@@ -160,7 +181,6 @@ class ExtractedFrame:
     processed_frame: ProcessedFrame
     pose_detected: bool
     landmarks: Optional[PoseLandmarks] = None
-    landmarks_full: Optional[np.ndarray] = None
     pose_quality_flags: list[PoseQualityFlag] = field(default_factory=list)
     frame_index: int = 0
 
@@ -184,8 +204,9 @@ class PoseExtractor:
     Phase 단계:
     - Phase 2-2a: `__init__` + LIVE_STREAM options + 모델 로딩
     - Phase 2-2b: `_on_result` 본체 (callback 시 dict 갱신, thread safety)
-    - Phase 2-2c-1 (본 단계): `process_frame` 골격 — detect_async + polling
-    - Phase 2-2c-2: result → `PoseLandmarks` 변환 (다음 commit)
+    - Phase 2-2c-1: `process_frame` 골격 — detect_async + polling
+    - Phase 2-2c-2 (본 단계): `_convert_result` + process_frame 통합 —
+      `PoseLandmarks | None` 반환
     """
 
     def __init__(self, cfg: MediaPipePoseConfig) -> None:
@@ -287,11 +308,12 @@ class PoseExtractor:
 
     def process_frame(
         self, frame: np.ndarray, timestamp_ms: int
-    ) -> object | None:
-        """동기 wrapper — detect_async 호출 + result polling (Phase 2-2c-1).
+    ) -> Optional[PoseLandmarks]:
+        """동기 wrapper — detect_async + polling + 변환 (Phase 2-2c-1 + 2-2c-2 통합).
 
-        호출자 입장 "frame 입력 → 결과 반환" 동기 인터페이스. 내부적으로
-        비동기 callback 결과를 lock 보호된 dict에서 polling.
+        호출자 입장 "frame 입력 → PoseLandmarks 반환" 동기 인터페이스. 내부적으로
+        비동기 callback 결과를 lock 보호된 dict에서 polling 후, `_convert_result`로
+        6종 LandmarkPair 조립하여 반환.
 
         timestamp_ms 정책: 호출자가 부여 (PoseExtractor는 시간 정책 미보유).
         monotonic increasing + 세션 내 unique 보장은 호출자 책임 (MediaPipe
@@ -303,9 +325,10 @@ class PoseExtractor:
             timestamp_ms: 호출자가 부여한 단조 증가 timestamp (ms).
 
         Returns:
-            `mp.tasks.vision.PoseLandmarkerResult` (변환 전 raw) 또는 None
-            (timeout 초과). 타입은 mediapipe typing 의존 회피로 `object`.
-            변환 (→ PoseLandmarks 6종)은 Phase 2-2c-2.
+            `PoseLandmarks` (6종 LandmarkPair, debug_mode=True 시 landmarks_full
+            포함) 또는 None — timeout 초과, 또는 MediaPipe pose 미검출, 또는
+            변환 예외 시. ExtractedFrame 조립(ProcessedFrame + 본 결과 + flags)은
+            호출자(pipeline) 책임.
 
         Notes:
             - polling 간격 `cfg.polling_interval_sec` (기본 1ms): busy loop
@@ -314,6 +337,7 @@ class PoseExtractor:
             - timeout 초과 시 `_pending_timestamps` 정리 안 함 — 늦게 도착한
               callback이 `_results`에 쌓이는 것은 `_on_result`의 dict 크기
               가드(10000)가 차단. 호출자는 None 받고 frame skip 결정.
+            - 변환은 `_convert_result`에 위임 (Phase 2-2c-2).
         """
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         if not rgb.flags["C_CONTIGUOUS"]:
@@ -331,7 +355,7 @@ class PoseExtractor:
             with self._lock:
                 result = self._results.pop(frame_index, None)
             if result is not None:
-                return result
+                return self._convert_result(result)
             elapsed = time.perf_counter() - poll_start
             if elapsed >= timeout_sec:
                 logger.warning(
@@ -343,6 +367,79 @@ class PoseExtractor:
                 )
                 return None
             time.sleep(self._cfg.polling_interval_sec)
+
+    def _convert_result(self, result) -> Optional[PoseLandmarks]:
+        """`PoseLandmarkerResult` → `PoseLandmarks` 변환 (Phase 2-2c-2).
+
+        MediaPipe 33점 raw landmark에서 운영 6종 (좌우 12점) 추출 + 조립.
+        `debug_mode=True` 시 33점 전체 raw (x, y, z, visibility) ndarray를
+        `landmarks_full`에 보존 — 디버그 자산만, 운영 6종은 z 미사용
+        (docs §3-4 정합).
+
+        MediaPipe POSE_LANDMARKS index (docs/2-3-3 §4-1):
+        - shoulder L/R = 11/12, hip L/R = 23/24, knee L/R = 25/26,
+          ankle L/R = 27/28, heel L/R = 29/30, foot_index L/R = 31/32.
+
+        견고성 가드:
+        - `result.pose_landmarks` None / 빈 list → None 반환 (pose 미검출, §4-2).
+        - landmark 길이 33 미만 → warning + None 반환 (예외 형식).
+        - 변환 예외 → `logger.exception` + None 반환 (메인 분석 흐름 보호).
+
+        Args:
+            result: `mp.tasks.vision.PoseLandmarkerResult` (typing 의존 회피로
+                직접 타입 없음).
+
+        Returns:
+            6종 `PoseLandmarks` 또는 None.
+        """
+        try:
+            pose_landmarks_list = getattr(result, "pose_landmarks", None)
+            if not pose_landmarks_list:
+                return None
+
+            lms = pose_landmarks_list[0]  # num_poses=1 정책 (docs §3-3)
+            if len(lms) < 33:
+                logger.warning(
+                    "_convert_result: landmark 길이 %d (33 미만, 예외 형식)",
+                    len(lms),
+                )
+                return None
+
+            def _lm(idx: int) -> Landmark:
+                p = lms[idx]
+                return Landmark(
+                    x=float(p.x), y=float(p.y), visibility=float(p.visibility)
+                )
+
+            shoulder = LandmarkPair(left=_lm(11), right=_lm(12))
+            hip = LandmarkPair(left=_lm(23), right=_lm(24))
+            knee = LandmarkPair(left=_lm(25), right=_lm(26))
+            ankle = LandmarkPair(left=_lm(27), right=_lm(28))
+            heel = LandmarkPair(left=_lm(29), right=_lm(30))
+            foot_index = LandmarkPair(left=_lm(31), right=_lm(32))
+
+            landmarks_full: Optional[np.ndarray] = None
+            if self._cfg.debug_mode:
+                landmarks_full = np.array(
+                    [
+                        (float(p.x), float(p.y), float(p.z), float(p.visibility))
+                        for p in lms
+                    ],
+                    dtype=np.float64,
+                )
+
+            return PoseLandmarks(
+                shoulder=shoulder,
+                hip=hip,
+                knee=knee,
+                ankle=ankle,
+                heel=heel,
+                foot_index=foot_index,
+                landmarks_full=landmarks_full,
+            )
+        except Exception:
+            logger.exception("_convert_result 예외 (swallow, None 반환)")
+            return None
 
 
 # ============================================================

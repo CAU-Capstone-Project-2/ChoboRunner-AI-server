@@ -211,7 +211,7 @@ class MediaPipePoseConfig(BaseModel):
     )
     debug_mode: bool = Field(
         default=False,
-        description="디버그 모드 — True 시 ExtractedFrame.landmarks_full (33점 전체) 채움. MVP 운영은 False (메모리 절약, 6종만 전달). 출처: docs/2-3-3 §4-1.",
+        description="디버그 모드 — True 시 PoseLandmarks.landmarks_full (33점 raw, x/y/z/visibility) 채움. MVP 운영은 False (메모리 절약, 6종만 전달). 출처: docs/2-3-3 §4-1.",
     )
     frame_timeout_sec: float = Field(
         default=0.5,
