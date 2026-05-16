@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal
 
 from choborunner_ai.config import VisibilityCheckConfig
 from choborunner_ai.pose_extractor import PoseLandmarks
@@ -91,17 +91,58 @@ REASON_CODE_SEVERITY: dict[ReasonCode, Severity] = {
     "body_not_fully_visible": "failed",
     "foot_out_of_frame": "failed",
 }
-"""docs §8-2 visibility/geometry reason code 강도 매핑.
+"""docs §8-2 visibility/geometry reason code **기본/default** severity 사전.
 
-§5-1: `foot_not_visible`만 failed — 발 미가시 시 IC 검출 불가, 핵심 지표 산출
-자체 불가. 나머지 3종은 low_confidence — 지표 산출은 가능하나 신뢰도 낮음.
-
-§5-2 / §5-3 (Phase 8-A 추가): `body_not_fully_visible` / `foot_out_of_frame`
-둘 다 failed (docs §8-2 표) — 전신/발 미포함은 분석 자체가 의미 없음.
+⚠️ 의미 변화 (Phase 8-B-1 δ 도입):
+- 기존 (Phase 4~8-A): 고정 severity 사전 (단일 severity per code)
+- 신규 (Phase 8-B-1~): **기본 severity 사전** — 산출 함수가 context-dependent
+  코드(예: docs §8-3 `invalid_view` failed/low_confidence 2강도)에 대해 override
+  가능. fixed severity 코드(§5-1/§5-2/§5-3)는 본 dict lookup 그대로 사용.
+- §5-1: `foot_not_visible`만 failed — 발 미가시 시 IC 검출 불가, 핵심 지표 산출
+  자체 불가. 나머지 3종은 low_confidence.
+- §5-2 / §5-3 (Phase 8-A): `body_not_fully_visible` / `foot_out_of_frame` 둘 다
+  failed (docs §8-2 표) — 전신/발 미포함은 분석 자체가 의미 없음.
 
 사용 위치는 §6 status 분기 별도 Phase (Phase 8-F). 본 dict 정의는 reason code
 사전과 함께 본 모듈에 위치 (SoT 정합).
+
+Phase 8-B 진입 시 `invalid_view` 추가 — 본 dict에는 등록 안 함 또는 default
+하나만 등록 (context에 따라 산출 함수가 override). Phase 8-B-2 신규 시점 결정.
 """
+
+
+# ============================================================
+# ReasonCodeEntry — 누적 평가 반환 typed dataclass (Phase 8-B-1 δ)
+# ============================================================
+
+
+@dataclass(frozen=True)
+class ReasonCodeEntry:
+    """누적 평가 함수의 반환 단위 — (reason_code, severity) typed pair.
+
+    Phase 8-B-1 δ 시그니처 통일:
+    - 기존 (Phase 4): `evaluate_visibility_accumulation -> list[ReasonCode]`
+    - 기존 (Phase 8-A): `evaluate_*_accumulation -> Optional[ReasonCode]`
+    - 신규 (Phase 8-B-1~): 모든 누적 평가 함수 반환 `list[ReasonCodeEntry]` 통일.
+
+    severity 결정 정책:
+    - fixed severity 코드: REASON_CODE_SEVERITY[code] default 그대로 사용
+      (§5-1 `lower_body_not_visible` 등 / §5-2 `body_not_fully_visible` /
+      §5-3 `foot_out_of_frame`)
+    - context-dependent 코드: 산출 함수가 context(예: frame 비율)로 결정
+      (docs §8-3 `invalid_view` failed/low_confidence — Phase 8-B-2 진입 시)
+
+    frozen=True 이유: 누적 평가 결과 불변 보장. status 분기 (Phase 8-F)가 본
+    list를 반복 평가하므로 mutation 회피.
+
+    Attributes:
+        reason_code: docs/2-3-5 §8 reason code 사전 키.
+        severity: 'failed' 또는 'low_confidence' (REASON_CODE_SEVERITY default 또는
+            산출 시점 override).
+    """
+
+    reason_code: ReasonCode
+    severity: Severity
 
 
 # ============================================================
@@ -270,7 +311,7 @@ def evaluate_frame_visibility(
 def evaluate_visibility_accumulation(
     results: list[FrameVisibilityResult],
     cfg: VisibilityCheckConfig,
-) -> list[ReasonCode]:
+) -> list[ReasonCodeEntry]:
     """누적 평가 — 유효 frame 비율 (docs/2-3-5 §5-1 5번).
 
     유효 frame 정의: `FrameVisibilityResult.is_valid=True` (4 카테고리 모두
@@ -280,21 +321,25 @@ def evaluate_visibility_accumulation(
     모집단: 입력 list 전체. 빈 list → 빈 list 반환 (모듈 경계, decision 5:
     frame 부족은 docs/2-3-1 `too_short` trigger 책임, 본 모듈 책임 외).
 
+    ⚠️ 시그니처 변경 (Phase 8-B-1 δ 도입):
+    - 기존 (Phase 4): `-> list[ReasonCode]`
+    - 신규: `-> list[ReasonCodeEntry]` — severity 정보 동반 (REASON_CODE_SEVERITY
+      default 'low_landmark_visibility' → 'low_confidence' wrap).
+
     Args:
         results: list[FrameVisibilityResult] (Phase 4-A 출력 누적).
         cfg: VisibilityCheckConfig. `valid_frame_ratio_min` 사용 (default 0.6).
 
     Returns:
-        list[ReasonCode]:
+        list[ReasonCodeEntry]:
         - 유효 비율 ≥ `valid_frame_ratio_min` 또는 빈 입력 → `[]`
-        - 유효 비율 < `valid_frame_ratio_min` → `["low_landmark_visibility"]`
-        단일 코드라도 list 형식 유지 (호출자 일관성, 향후 §5-2~5-7 누적 함수
-        확장 시 동일 시그니처).
+        - 유효 비율 < `valid_frame_ratio_min` →
+          `[ReasonCodeEntry('low_landmark_visibility', 'low_confidence')]`
 
     견고성 가드:
     - 빈 list → `[]` (zero division 가드, 모듈 경계).
-    - 평가 예외 → `logger.exception` + `["low_landmark_visibility"]` failed-safe
-      ("평가 못 함" 시그널, 메인 분석 흐름 보호).
+    - 평가 예외 → `logger.exception` + failed-safe (low_landmark_visibility,
+      low_confidence) 반환.
     """
     try:
         if not results:
@@ -302,14 +347,24 @@ def evaluate_visibility_accumulation(
         valid_count = sum(1 for r in results if r.is_valid)
         ratio = valid_count / len(results)
         if ratio < cfg.valid_frame_ratio_min:
-            return ["low_landmark_visibility"]
+            return [
+                ReasonCodeEntry(
+                    reason_code="low_landmark_visibility",
+                    severity=REASON_CODE_SEVERITY["low_landmark_visibility"],
+                )
+            ]
         return []
     except Exception:
         logger.exception(
             "evaluate_visibility_accumulation 예외 "
             "(swallow, low_landmark_visibility 반환)"
         )
-        return ["low_landmark_visibility"]
+        return [
+            ReasonCodeEntry(
+                reason_code="low_landmark_visibility",
+                severity=REASON_CODE_SEVERITY["low_landmark_visibility"],
+            )
+        ]
 
 
 # ============================================================
@@ -557,84 +612,110 @@ def evaluate_frame_foot_cutoff(
 def evaluate_body_inclusion_accumulation(
     results: list[FrameGeometryResult],
     cfg: VisibilityCheckConfig,
-) -> Optional[ReasonCode]:
+) -> list[ReasonCodeEntry]:
     """§5-2 body 포함 누적 평가 — 통과 frame 비율 (docs/2-3-5 §5-2 frame 비율 60%).
 
     유효 frame 정의: `FrameGeometryResult.is_valid=True` (body_visibility AND
     body_coords 통과). 본 함수는 `evaluate_frame_body_inclusion` 출력 누적만
     입력으로 받음 — `evaluate_frame_foot_cutoff` 출력 섞으면 의미 깨짐.
 
-    모집단: 입력 list 전체. 빈 list → None (frame 부족은 docs/2-3-1 `too_short`
+    모집단: 입력 list 전체. 빈 list → 빈 list (frame 부족은 docs/2-3-1 `too_short`
     책임, 본 모듈 책임 외 — §5-1 패턴 일관).
+
+    ⚠️ 시그니처 변경 (Phase 8-B-1 δ 도입):
+    - 기존 (Phase 8-A): `-> Optional[ReasonCode]`
+    - 신규: `-> list[ReasonCodeEntry]` — `body_not_fully_visible`은 fixed severity
+      'failed' (REASON_CODE_SEVERITY default 그대로). Phase 8-A lock 5-6 catch
+      해소 — 모든 누적 함수 시그니처 통일.
 
     Args:
         results: list[FrameGeometryResult] (`evaluate_frame_body_inclusion` 누적).
         cfg: VisibilityCheckConfig. `body_inclusion_frame_ratio_min` (default 0.6).
 
     Returns:
-        Optional[ReasonCode]:
-        - 통과 비율 ≥ `body_inclusion_frame_ratio_min` 또는 빈 입력 → None
-        - 통과 비율 < `body_inclusion_frame_ratio_min` → 'body_not_fully_visible'
+        list[ReasonCodeEntry]:
+        - 통과 비율 ≥ `body_inclusion_frame_ratio_min` 또는 빈 입력 → `[]`
+        - 통과 비율 < `body_inclusion_frame_ratio_min` →
+          `[ReasonCodeEntry('body_not_fully_visible', 'failed')]`
 
-        ⚠️ 시그니처 catch (Phase 8-A lock 5-6 α 정합):
-        본 함수 반환은 `Optional[ReasonCode]` — §5-1 `evaluate_visibility_accumulation`
-        의 `list[ReasonCode]`와 다름. §5-1 docstring은 "향후 §5-2~5-7 누적 함수 확장
-        시 동일 시그니처" 의도였으나, Phase 8-A에서 단일 reason code 함수당 1개
-        대응 명확화를 위해 Optional 채택. 향후 §6 status 분기 단계 (Phase 8-F)에서
-        list 통일 검토.
-
-    견고성 가드: 빈 list → None (zero division), 평가 예외 → failed-safe
-    ('body_not_fully_visible' 반환).
+    견고성 가드: 빈 list → `[]` (zero division), 평가 예외 → failed-safe
+    (body_not_fully_visible, failed) 반환.
     """
     try:
         if not results:
-            return None
+            return []
         valid_count = sum(1 for r in results if r.is_valid)
         ratio = valid_count / len(results)
         if ratio < cfg.body_inclusion_frame_ratio_min:
-            return "body_not_fully_visible"
-        return None
+            return [
+                ReasonCodeEntry(
+                    reason_code="body_not_fully_visible",
+                    severity=REASON_CODE_SEVERITY["body_not_fully_visible"],
+                )
+            ]
+        return []
     except Exception:
         logger.exception(
             "evaluate_body_inclusion_accumulation 예외 "
             "(swallow, body_not_fully_visible 반환)"
         )
-        return "body_not_fully_visible"
+        return [
+            ReasonCodeEntry(
+                reason_code="body_not_fully_visible",
+                severity=REASON_CODE_SEVERITY["body_not_fully_visible"],
+            )
+        ]
 
 
 def evaluate_foot_cutoff_accumulation(
     results: list[FrameGeometryResult],
     cfg: VisibilityCheckConfig,
-) -> Optional[ReasonCode]:
+) -> list[ReasonCodeEntry]:
     """§5-3 발 잘림 누적 평가 — 통과 frame 비율 (docs/2-3-5 §5-3 frame 비율 60%).
 
     유효 frame 정의: `FrameGeometryResult.is_valid=True` (foot_cutoff 통과).
     본 함수는 `evaluate_frame_foot_cutoff` 출력 누적만 입력으로 받음.
 
-    모집단: 입력 list 전체. 빈 list → None (§5-1 패턴 일관, frame 부족 책임 외).
+    모집단: 입력 list 전체. 빈 list → 빈 list (§5-1 패턴 일관, frame 부족 책임 외).
+
+    ⚠️ 시그니처 변경 (Phase 8-B-1 δ 도입):
+    - 기존 (Phase 8-A): `-> Optional[ReasonCode]`
+    - 신규: `-> list[ReasonCodeEntry]` — `foot_out_of_frame`은 fixed severity
+      'failed' (REASON_CODE_SEVERITY default 그대로).
 
     Args:
         results: list[FrameGeometryResult] (`evaluate_frame_foot_cutoff` 누적).
         cfg: VisibilityCheckConfig. `foot_cutoff_frame_ratio_min` (default 0.6).
 
     Returns:
-        Optional[ReasonCode]:
-        - 통과 비율 ≥ `foot_cutoff_frame_ratio_min` 또는 빈 입력 → None
-        - 통과 비율 < `foot_cutoff_frame_ratio_min` → 'foot_out_of_frame'
+        list[ReasonCodeEntry]:
+        - 통과 비율 ≥ `foot_cutoff_frame_ratio_min` 또는 빈 입력 → `[]`
+        - 통과 비율 < `foot_cutoff_frame_ratio_min` →
+          `[ReasonCodeEntry('foot_out_of_frame', 'failed')]`
 
-    견고성 가드: 빈 list → None, 평가 예외 → failed-safe ('foot_out_of_frame').
+    견고성 가드: 빈 list → `[]`, 평가 예외 → failed-safe.
     """
     try:
         if not results:
-            return None
+            return []
         valid_count = sum(1 for r in results if r.is_valid)
         ratio = valid_count / len(results)
         if ratio < cfg.foot_cutoff_frame_ratio_min:
-            return "foot_out_of_frame"
-        return None
+            return [
+                ReasonCodeEntry(
+                    reason_code="foot_out_of_frame",
+                    severity=REASON_CODE_SEVERITY["foot_out_of_frame"],
+                )
+            ]
+        return []
     except Exception:
         logger.exception(
             "evaluate_foot_cutoff_accumulation 예외 "
             "(swallow, foot_out_of_frame 반환)"
         )
-        return "foot_out_of_frame"
+        return [
+            ReasonCodeEntry(
+                reason_code="foot_out_of_frame",
+                severity=REASON_CODE_SEVERITY["foot_out_of_frame"],
+            )
+        ]

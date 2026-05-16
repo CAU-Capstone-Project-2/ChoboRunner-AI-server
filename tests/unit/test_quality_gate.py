@@ -1,16 +1,26 @@
-"""quality_gate.py unit 테스트 — docs/2-3-5 §5-2 + §5-3 (Phase 8-A).
+"""quality_gate.py unit 테스트 — docs/2-3-5 §5-2 + §5-3 (Phase 8-A + 8-B-1).
 
 본 파일은 Phase 8-A 신규 — `tmp/phase_8_a_sanity.py` 8 case 이식 + pytest 형식.
+
+Phase 8-B-1 (δ 시그니처 통일):
+- 누적 평가 함수 3종 반환 시그니처 변경: Optional[ReasonCode] /
+  list[ReasonCode] → list[ReasonCodeEntry]
+- 본 파일 backport: C/D 카테고리 3 case 수정 (Optional[ReasonCode] 가정 →
+  list[ReasonCodeEntry] 검증)
+- 신규 case 1: ReasonCodeEntry severity 정합 확인
 
 ⚠️ §5-1 (evaluate_frame_visibility / evaluate_visibility_accumulation, Phase 4)는
    본 파일에서 다루지 않음 (Phase 4는 sanity script만 작성 — scripts/sanity/
    phase_4_c_integration.py). 향후 §5-1 pytest 이식은 별도 cleanup 후보.
+   Phase 8-B-1 시그니처 통일은 §5-1 함수 본체에 적용됐지만 본 파일은 §5-2/§5-3만
+   test — §5-1 test 부재 catch 그대로.
 
-8 case:
+9 case (8 → 9, +1 case for ReasonCodeEntry severity):
 - A. evaluate_frame_body_inclusion (3)
 - B. evaluate_frame_foot_cutoff (2)
-- C. evaluate_body_inclusion_accumulation (2)
-- D. evaluate_foot_cutoff_accumulation (1)
+- C. evaluate_body_inclusion_accumulation (2 + δ 시그니처 backport)
+- D. evaluate_foot_cutoff_accumulation (1 + δ 시그니처 backport)
+- E. ReasonCodeEntry severity 정합 (1, Phase 8-B-1 신규)
 """
 from __future__ import annotations
 
@@ -19,7 +29,9 @@ import pytest
 from choborunner_ai.config import VisibilityCheckConfig
 from choborunner_ai.pose_extractor import Landmark, LandmarkPair, PoseLandmarks
 from choborunner_ai.quality_gate import (
+    REASON_CODE_SEVERITY,
     FrameGeometryResult,
+    ReasonCodeEntry,
     evaluate_body_inclusion_accumulation,
     evaluate_foot_cutoff_accumulation,
     evaluate_frame_body_inclusion,
@@ -135,23 +147,25 @@ def test_foot_cutoff_one_point_violation(cfg: VisibilityCheckConfig):
 
 
 def test_body_inclusion_accumulation_pass(cfg: VisibilityCheckConfig):
-    """70% 통과 (7 valid / 3 invalid) → None (임계 60% 이상)."""
+    """70% 통과 (7 valid / 3 invalid) → [] (Phase 8-B-1 δ: 빈 list)."""
     results = (
         [FrameGeometryResult(is_valid=True) for _ in range(7)]
         + [FrameGeometryResult(is_valid=False) for _ in range(3)]
     )
     out = evaluate_body_inclusion_accumulation(results, cfg)
-    assert out is None
+    assert out == []
 
 
 def test_body_inclusion_accumulation_fail(cfg: VisibilityCheckConfig):
-    """50% 통과 (5 valid / 5 invalid) → 'body_not_fully_visible' (임계 60% 미달)."""
+    """50% 통과 → [ReasonCodeEntry('body_not_fully_visible', 'failed')] (8-B-1 δ)."""
     results = (
         [FrameGeometryResult(is_valid=True) for _ in range(5)]
         + [FrameGeometryResult(is_valid=False) for _ in range(5)]
     )
     out = evaluate_body_inclusion_accumulation(results, cfg)
-    assert out == "body_not_fully_visible"
+    assert len(out) == 1
+    assert out[0].reason_code == "body_not_fully_visible"
+    assert out[0].severity == "failed"
 
 
 # ============================================================
@@ -160,10 +174,37 @@ def test_body_inclusion_accumulation_fail(cfg: VisibilityCheckConfig):
 
 
 def test_foot_cutoff_accumulation_fail(cfg: VisibilityCheckConfig):
-    """50% 통과 → 'foot_out_of_frame' (임계 60% 미달)."""
+    """50% 통과 → [ReasonCodeEntry('foot_out_of_frame', 'failed')] (8-B-1 δ)."""
     results = (
         [FrameGeometryResult(is_valid=True) for _ in range(5)]
         + [FrameGeometryResult(is_valid=False) for _ in range(5)]
     )
     out = evaluate_foot_cutoff_accumulation(results, cfg)
-    assert out == "foot_out_of_frame"
+    assert len(out) == 1
+    assert out[0].reason_code == "foot_out_of_frame"
+    assert out[0].severity == "failed"
+
+
+# ============================================================
+# E. ReasonCodeEntry severity 정합 (Phase 8-B-1 신규)
+# ============================================================
+
+
+def test_reason_code_entry_default_severity_lookup():
+    """ReasonCodeEntry severity가 REASON_CODE_SEVERITY default와 정합.
+
+    Phase 8-B-1 δ 도입 — 누적 평가 함수가 REASON_CODE_SEVERITY default를 사용해
+    ReasonCodeEntry를 wrap. 본 case는 default 사전 lookup 정합 회귀.
+
+    frozen=True 검증도 동시 — 누적 평가 결과 불변 보장.
+    """
+    # default 사전 lookup 정합
+    assert REASON_CODE_SEVERITY["body_not_fully_visible"] == "failed"
+    assert REASON_CODE_SEVERITY["foot_out_of_frame"] == "failed"
+    assert REASON_CODE_SEVERITY["low_landmark_visibility"] == "low_confidence"
+    assert REASON_CODE_SEVERITY["lower_body_not_visible"] == "low_confidence"
+
+    # frozen=True 검증
+    entry = ReasonCodeEntry(reason_code="body_not_fully_visible", severity="failed")
+    with pytest.raises(Exception):  # FrozenInstanceError (dataclass frozen)
+        entry.reason_code = "foot_out_of_frame"  # type: ignore[misc]
