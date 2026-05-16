@@ -5,8 +5,9 @@
 
 Phase 5-B 작업 단위:
 - Phase 5-B-1: Stage 1 단독 (Zeni 2008, heel_rel_x local max)
-- Phase 5-B-2 (본 단계): Stage 2 추가 (Fellin 2010, foot v_y zero-crossing) + confidence
-- Phase 5-B-3: batch compute_ic_indices wrapper + analysis_side + pytest 회귀
+- Phase 5-B-2: Stage 2 추가 (Fellin 2010, foot v_y zero-crossing) + confidence
+- Phase 5-B-3 (본 단계): batch compute_ic_indices wrapper + pytest 회귀
+  → Day 5 decision i γ 완성 (stream API + batch wrapper 둘 다)
 
 학술 알고리즘:
 - Zeni, J. A. et al. (2008). Gait & Posture, 27(4), 710-714.
@@ -345,3 +346,52 @@ class ICDetector:
             if velocities[i] > 0 and velocities[i + 1] <= 0:
                 crossings.append(i)
         return crossings
+
+
+# ============================================================
+# Batch wrapper (Phase 5-B-3, Day 5 decision i γ 완성)
+# ============================================================
+
+
+def compute_ic_indices(
+    landmarks_series: list[Optional[PoseLandmarks]],
+    analysis_side: Literal["left", "right"],
+    cfg: ICDetectorConfig,
+    visibility_min: float = 0.6,
+) -> list[ICResult]:
+    """Batch wrapper — `list[Optional[PoseLandmarks]]` → `list[ICResult]`.
+
+    Stream API `on_new_frame`을 매 frame 호출, 누적 결과 반환. ICDetector
+    인스턴스 1개 + 순회 패턴. Day 5 decision i γ 완성 (stream + batch 둘 다).
+
+    Args:
+        landmarks_series: `list[PoseLandmarks | None]` (decision i β).
+            Pipeline.run_on_video_file 흐름 정합 (pose 미검출 frame None).
+        analysis_side: 'left' 또는 'right' (decision iii).
+        cfg: ICDetectorConfig.
+        visibility_min: Stage 1 visibility 가드 임계 (default 0.6).
+
+    Returns:
+        `list[ICResult]` (decision ii α — rich: frame_index + confidence + offset).
+        호출자가 frame_index만 추출 시 `[r.frame_index for r in results]`,
+        `trunk_lean.compute_at_ic(landmarks_series, ic_indices=...)` 호환.
+
+    None frame 처리 (decision iii α):
+    - `if pl is None: continue` (buffer 미적재 skip)
+    - frame_idx는 enumerate 절대 인덱스 유지 (시간 일관성)
+
+    통합 sanity (trunk_lean.compute_at_ic 연결 등)는 본 Phase 5-B-3 scope
+    밖 (decision v β) — 별도 Phase 5 통합 마일스톤 (5-E 또는 Pipeline 통합).
+
+    Raises:
+        ValueError: analysis_side가 'left'/'right' 아닐 시 (on_new_frame 가드 전파).
+    """
+    detector = ICDetector(cfg, visibility_min=visibility_min)
+    results: list[ICResult] = []
+    for idx, pl in enumerate(landmarks_series):
+        if pl is None:
+            continue
+        r = detector.on_new_frame(idx, pl, analysis_side)
+        if r is not None:
+            results.append(r)
+    return results
