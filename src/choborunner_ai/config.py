@@ -380,6 +380,12 @@ class TrunkLeanConfig(BaseModel):
         default=10.0,
         description="θ_trunk > 10° → Above Typical Range (일반 범위 초과, Teng & Powers 2014 참고). ⚠️ 파일럿 보정.",
     )
+    visibility_min: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Shoulder L/R + hip L/R 4점 visibility 임계 (docs/2-3-4 §7-2 '0.6 이상' 명시). 미달 시 trunk lean = NaN. ⚠️ 파일럿 보정.",
+    )
 
 
 # ============================================================
