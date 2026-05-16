@@ -355,6 +355,12 @@ class KneeFlexionConfig(BaseModel):
         default=25.0,
         description="knee_flexion ≥ 25° → Above Typical Range (충격 흡수↑/효율↓ trade-off). ⚠️ 파일럿 보정.",
     )
+    visibility_min: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Hip/knee/ankle 분석측 3점 visibility 임계 (docs §6-2 정합). 미달 시 knee_flexion=NaN. ⚠️ 파일럿 보정.",
+    )
 
 
 class TrunkLeanConfig(BaseModel):
