@@ -327,6 +327,12 @@ class FootStrikeConfig(BaseModel):
         ge=0.0,
         description="분류 전환 히스테리시스 폭 ±3° (잦은 분류 변동 방지, docs/2-3-4 §5-6).",
     )
+    visibility_min: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="heel + foot_index 분석측 2점 visibility 임계 (docs §5-7 정합, ankle 제외). 미달 시 foot_strike=NaN/Uncertain. ⚠️ 파일럿 보정.",
+    )
 
 
 class KneeFlexionConfig(BaseModel):
