@@ -4,8 +4,8 @@
 정답 구현.
 
 Phase 5-B 작업 단위:
-- Phase 5-B-1 (본 단계): Stage 1 단독 (Zeni 2008, heel_rel_x local max)
-- Phase 5-B-2: Stage 2 추가 (Fellin 2010, foot v_y zero-crossing) + confidence
+- Phase 5-B-1: Stage 1 단독 (Zeni 2008, heel_rel_x local max)
+- Phase 5-B-2 (본 단계): Stage 2 추가 (Fellin 2010, foot v_y zero-crossing) + confidence
 - Phase 5-B-3: batch compute_ic_indices wrapper + analysis_side + pytest 회귀
 
 학술 알고리즘:
@@ -23,10 +23,25 @@ Stage 1 (Zeni 2008) — heel_rel_x local max (Phase 5-B-1 본 단계):
 - 부록 D 합성 sanity: MAE 33.3ms, Median 33.3ms, 검출률 100%
   (heel forward peak가 실제 IC보다 ~1 frame lead)
 
-Stage 2 (Fellin 2010) — foot v_y 양→음 zero-crossing (Phase 5-B-2 추가 예정):
-    v_y(t) = (foot_y(t) - foot_y(t-1)) * fps
-    IC = v_y가 양→음 전환 시점 (하강 멈추고 반발 진입)
-- 부록 D hybrid 결과: MAE 9.6ms (-71.2% 개선 vs Stage 1 단독)
+Stage 2 (Fellin 2010) — foot v_y 양→음 zero-crossing (Phase 5-B-2 본 단계):
+    v_y_heel(t) = (heel.y(t) - heel.y(t-1)) * fps
+    v_y_foot(t) = (foot_index.y(t) - foot_index.y(t-1)) * fps
+    IC = v_y가 양→음 전환 시점 (하강 멈추고 반발/상승 진입)
+
+- **heel + foot_index 둘 다 추적, 더 일찍 부호 전환 시점 채택** (docs §4-2 본문 정합)
+  → RFS / MFS / FFS 모두 강건 (Milner 2015, Handsaker 2016)
+- 이산 채택 규칙: v_y[t] > 0 AND v_y[t+1] ≤ 0 만족 가장 이른 t → IC = t+1
+- 부록 D hybrid 결과: MAE 9.6ms (-71.2% 개선 vs Stage 1 단독 33.3ms)
+  Fellin 2010 RMSE ≤ 8ms 자릿수 일치
+
+⚠️ 부록 B 의사코드 catch (Day 6 학습 자산):
+- catch ①: 부록 B 의사코드는 foot_y만 사용 (단순화). docs §4-2 본문은 heel + foot
+  둘 다 추적 명시. 정식 구현은 docs 본문 정합 (decision i β, CLAUDE.md §4 단일 정답).
+- catch ②: 부록 B _find_pos_to_neg는 int 반환 (`return i`)이나 사용처는
+  `min(crossings)` list 가정 → 로직 오류. docs §4-2 "가장 이른 t" 정합 위해
+  list 반환으로 정정 (decision ii α).
+- decision vi (Phase 5-B-1) 일관성: "부록 B 의사코드 직접 구현"은 buffer 구조
+  1:1 의도. 알고리즘은 docs 본문 단일 정답 — decision vi 위반 X.
 
 좌표계 (docs §3-2): x 좌→우, y 화면 아래 + (MediaPipe convention).
 - y 증가 = 발 하강 (v_y > 0)
@@ -81,8 +96,8 @@ ICConfidence = Literal["high", "medium", "low"]
 - 'low'   : Stage 2 zero-crossing 실패 (Stage 1 그대로 사용)
             → docs §4-3: stride 누적 통계 제외 (가중치 0)
 
-Phase 5-B-1 (Stage 1 단독): 모든 IC는 'low' 부여 — Stage 2 미수행이라 Stage 2
-실패와 동일 표시. 5-B-2 Stage 2 추가 후 high/medium/low 정상 분류.
+Phase 5-B-2 (본 단계): Stage 2 추가로 high/medium/low 정상 분류 작동.
+임계 inline 2 frame (decision iii, 부록 B 의사코드 1:1, 향후 cfg 이동 검토).
 """
 
 
@@ -115,8 +130,9 @@ class ICResult:
 class ICDetector:
     """2단계 hybrid IC detector — stream API (docs/2-3-4 §4 + 부록 B 의사코드).
 
-    Phase 5-B-1 (본 단계): Stage 1 단독 (Zeni 2008 heel_rel_x local max).
-    Stage 2 (Fellin 2010)는 Phase 5-B-2 추가.
+    Phase 5-B-2 (본 단계): Stage 1+2 hybrid 완성.
+    - Stage 1 (Zeni 2008): heel_rel_x local max 후보 검출
+    - Stage 2 (Fellin 2010): heel + foot v_y zero-crossing 정밀화 + confidence 분류
 
     stream API: on_new_frame(frame_idx, pl, analysis_side) → Optional[ICResult].
     호출자가 매 frame 호출, IC 검출 시에만 ICResult 반환.
@@ -124,12 +140,12 @@ class ICDetector:
     인스턴스 1개 원칙 — buffer / last_ic_frame 상태 보유.
     Batch wrapper (Phase 5-B-3): compute_ic_indices(landmarks_series, ...).
 
-    부록 B 의사코드 흐름:
+    부록 B 의사코드 흐름 (docs §4-2 본문 정합으로 정정):
         1. buffer 적재
         2. warmup
         3. Stage 1 (heel_rel_x local max + visibility + interval 가드)
-        4. (5-B-2) Stage 2 정밀화 + confidence 분류
-        Phase 5-B-1: Stage 1 candidate 그대로 IC, confidence='low'.
+        4. Stage 2 정밀화 (heel + foot 둘 다 v_y zero-crossing, 더 일찍 채택)
+           + confidence 분류 (high/medium/low, docs §4-3)
 
     Args:
         cfg: ICDetectorConfig — fps / buffer_size / lookahead / refine_window /
@@ -155,17 +171,20 @@ class ICDetector:
         pl: PoseLandmarks,
         analysis_side: Literal["left", "right"],
     ) -> Optional[ICResult]:
-        """단일 frame 입력 → IC 검출 (Phase 5-B-1: Stage 1 단독).
+        """단일 frame 입력 → IC 검출 (Phase 5-B-2: Stage 1+2 hybrid).
 
-        부록 B 의사코드 1:1 흐름:
+        부록 B 의사코드 흐름 (docs §4-2 본문 정합 정정):
         1. buffer 적재 (pelvis_x, heel_rel_x, heel_y, foot_y, visibility)
         2. warmup: len(buffer) < LOOKAHEAD*2+1 → None
         3. Stage 1: check_pos = len(buffer) - LOOKAHEAD - 1
            - _is_local_max(heel_rel_arr, check_pos, LOOKAHEAD)
            - visibility >= visibility_min
            - frame_idx - last_ic_frame >= MIN_IC_INTERVAL
-        4. Phase 5-B-1: Stage 1 candidate → ICResult(confidence='low')
-           Phase 5-B-2: Stage 2 정밀화 + confidence high/medium 분류
+        4. Stage 2: search window ±REFINE_WINDOW
+           - heel v_y / foot v_y 둘 다 양→음 zero-crossing 검색
+           - 둘 중 더 일찍 부호 전환 시점 채택 (docs §4-2 본문 정합)
+           - 둘 다 빈 → low confidence + Stage 1 그대로
+        5. confidence 분류: |offset| ≤ 2 → high, > 2 → medium, Stage 2 실패 → low
 
         Args:
             frame_idx: 절대 frame 인덱스 (영상 시작 0).
@@ -223,15 +242,57 @@ class ICDetector:
         ):
             return None
 
-        # ── 4. Phase 5-B-1: Stage 1 candidate 그대로 IC ───
-        # Stage 2 정밀화 (foot v_y zero-crossing)는 Phase 5-B-2 추가.
-        # 본 단계는 confidence='low' (Stage 2 미수행 = Stage 2 실패와 동일 표시).
-        ic_frame = candidate["frame_idx"]
+        # ── 4. Stage 2: Fellin 2010 — heel + foot v_y zero-crossing 정밀화 ──
+        # search window: buffer[check_pos - REFINE_WINDOW : check_pos + REFINE_WINDOW + 1]
+        start = max(0, check_pos - self._cfg.refine_window)
+        end = check_pos + self._cfg.refine_window + 1
+        search = [self._buffer[i] for i in range(start, end)]
+
+        # heel + foot 두 v_y (docs §4-2 본문 정합, decision i β)
+        # v_y[j] = (search[j+1].y - search[j].y) * fps, j ∈ [0, len(search)-2]
+        v_y_heel = [
+            (search[i]["heel_y"] - search[i - 1]["heel_y"]) * self._cfg.fps
+            for i in range(1, len(search))
+        ]
+        v_y_foot = [
+            (search[i]["foot_y"] - search[i - 1]["foot_y"]) * self._cfg.fps
+            for i in range(1, len(search))
+        ]
+
+        # 양→음 zero-crossings (list 반환, decision ii α — 부록 B catch 정정)
+        heel_crossings = self._find_pos_to_neg(v_y_heel)
+        foot_crossings = self._find_pos_to_neg(v_y_foot)
+
+        # 둘 중 더 일찍 부호 전환 시점 채택 (decision vi)
+        heel_idx = min(heel_crossings) if heel_crossings else None
+        foot_idx = min(foot_crossings) if foot_crossings else None
+
+        # ── 5. IC 확정 + confidence 분류 ────────────────────
+        if heel_idx is None and foot_idx is None:
+            # Stage 2 실패 → low confidence + Stage 1 그대로 (decision iv, 부록 B 정합)
+            ic_frame = candidate["frame_idx"]
+            confidence: ICConfidence = "low"
+            offset = 0
+        else:
+            # 둘 다 있으면 min, 한쪽만 있으면 그쪽 (decision vi: 더 일찍)
+            if heel_idx is None:
+                earliest_idx = foot_idx
+            elif foot_idx is None:
+                earliest_idx = heel_idx
+            else:
+                earliest_idx = min(heel_idx, foot_idx)
+            # IC = 첫 비양수 프레임 (v_y[j+1]) → search 인덱스 j+1
+            ic_idx_in_search = earliest_idx + 1
+            ic_frame = search[ic_idx_in_search]["frame_idx"]
+            offset = ic_frame - candidate["frame_idx"]
+            # confidence (decision iii — 인라인 2, 부록 B 1:1)
+            confidence = "high" if abs(offset) <= 2 else "medium"
+
         self._last_ic_frame = ic_frame
         return ICResult(
             frame_index=ic_frame,
-            confidence="low",
-            stage1_offset=0,
+            confidence=confidence,
+            stage1_offset=offset,
         )
 
     @staticmethod
@@ -258,3 +319,29 @@ class ICDetector:
             if arr[idx - off] >= v or arr[idx + off] >= v:
                 return False
         return True
+
+    @staticmethod
+    def _find_pos_to_neg(velocities: list[float]) -> list[int]:
+        """v_y[i] > 0 AND v_y[i+1] ≤ 0 만족 인덱스 list 반환 (docs §4-2 정합).
+
+        부록 B 의사코드 로직 오류 정정 (decision ii, Day 6 학습 자산):
+        - 부록 B 의사코드: `return i` int 반환 + 사용처 `min(crossings)` list
+          가정 → 불일치 (i=0 매치 시 `if not crossings` falsy 오작동 + min 적용 불가)
+        - 정정: 모든 crossings list 반환 + 호출자가 `min()` 적용
+        - docs §4-2 본문 "가장 이른 t" 정합 = list 중 min
+
+        IC 해석 (호출자):
+        - earliest_idx = min(crossings) (가장 이른 양→음 전환)
+        - ic_idx_in_search = earliest_idx + 1 (첫 비양수 프레임)
+
+        Args:
+            velocities: v_y list (heel 또는 foot vertical velocity).
+
+        Returns:
+            crossings list. 빈 list = zero-crossing 미발견 (low confidence trigger).
+        """
+        crossings: list[int] = []
+        for i in range(len(velocities) - 1):
+            if velocities[i] > 0 and velocities[i + 1] <= 0:
+                crossings.append(i)
+        return crossings
