@@ -114,17 +114,27 @@ class PoseLandmarks:
     - heel: Foot Strike Pattern, IC 검출
     - foot_index: Foot Strike Pattern, IC 검출
 
+    추가 단일점 (Phase 8-A 추가):
+    - nose: 머리 위치 — quality_gate §5-2 body 포함 검사. 운영 path는 항상 채움
+      (`_convert_result`에서 `_lm(0)` 추출). 합성 fixture / 기존 test/sanity는
+      미지정 (default None) — §5-2 검사 시 None은 visibility=0 취급 (실패).
+
     Attributes:
         shoulder/hip/knee/ankle/heel/foot_index: 6종 LandmarkPair (좌/우).
             각 Landmark는 (x, y, visibility) 3필드 — docs §3-4 normalized
             좌표 정책 (z 미사용).
+        nose: 단일 Landmark (좌/우 X, 정중앙 1점). docs/2-3-5 §5-2 nose+ankle
+            visibility 검사 + 전신 좌표 범위 검사용. **default None** — 합성
+            fixture/legacy test의 기존 인스턴스 무변경 보존 (Phase 8-A lock 5-1
+            α 정합). 운영 path(`_convert_result`)는 항상 `_lm(0)` 채움.
         landmarks_full: 디버그 모드 raw 33점 `np.ndarray (33, 4)` [x, y, z,
             visibility]. `MediaPipePoseConfig.debug_mode=True`일 때만 채움,
             그 외 None (§4-1 메모리 절약). **z는 디버그 raw 자산만** — 운영
             6종은 z 미보존.
 
     `to_numpy()` 반환: (12, 3) — 6 종 × 2 (좌/우) × 3 (x, y, vis). landmarks_full
-    포함 안 함 (디버그 자산 분리).
+    포함 안 함 (디버그 자산 분리). **nose 미포함** — 운영 12점 contract 보존
+    (Phase 8-A 결정, scripts/sanity/phase_2_2c_3_integration.py 회귀 보호).
     행 순서: shoulder L/R, hip L/R, knee L/R, ankle L/R, heel L/R, foot_index L/R.
     """
 
@@ -134,6 +144,7 @@ class PoseLandmarks:
     ankle: LandmarkPair
     heel: LandmarkPair
     foot_index: LandmarkPair
+    nose: Optional[Landmark] = None
     landmarks_full: Optional[np.ndarray] = None
 
     def to_numpy(self) -> np.ndarray:
@@ -417,6 +428,7 @@ class PoseExtractor:
             ankle = LandmarkPair(left=_lm(27), right=_lm(28))
             heel = LandmarkPair(left=_lm(29), right=_lm(30))
             foot_index = LandmarkPair(left=_lm(31), right=_lm(32))
+            nose = _lm(0)  # MediaPipe NOSE=0 (Phase 8-A §5-2 body 검사용)
 
             landmarks_full: Optional[np.ndarray] = None
             if self._cfg.debug_mode:
@@ -435,6 +447,7 @@ class PoseExtractor:
                 ankle=ankle,
                 heel=heel,
                 foot_index=foot_index,
+                nose=nose,
                 landmarks_full=landmarks_full,
             )
         except Exception:

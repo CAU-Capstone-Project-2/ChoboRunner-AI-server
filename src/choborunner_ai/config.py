@@ -442,10 +442,23 @@ class VisibilityCheckConfig(BaseModel):
         description="visibility 임계 통과 frame 비율 최소. 미달 시 `low_landmark_visibility`.",
     )
     # §5-2 전신 포함
+    body_inclusion_visibility_min: float = Field(
+        default=0.6,
+        ge=0.0, le=1.0,
+        description="docs/2-3-5 §5-2 1번 — nose + 양측 ankle visibility 임계 (default 0.6). frame-level 통과 = nose.visibility ≥ 임계 AND ankle L/R 둘 다 visibility ≥ 임계.",
+    )
+    coordinate_min: float = Field(
+        default=0.0,
+        description="docs/2-3-5 §5-2 2번 — landmark 좌표 [coord_min, coord_max] 범위 하한 (정규화 좌표 [0, 1] 기준, docs/2-3-3 §3-4).",
+    )
+    coordinate_max: float = Field(
+        default=1.0,
+        description="docs/2-3-5 §5-2 2번 — landmark 좌표 범위 상한. 13점(6 LandmarkPair 12점 + nose) 모두 [coord_min, coord_max] 내 충족 시 §5-2 2번 통과.",
+    )
     body_inclusion_frame_ratio_min: float = Field(
         default=0.6,
         ge=0.0, le=1.0,
-        description="nose/ankle visibility ≥ 0.6 AND 전신 좌표 [0,1] 범위 내 frame 비율 최소. 미달 시 `body_not_fully_visible`.",
+        description="nose/ankle visibility 임계 AND 전신 좌표 [0,1] 범위 내 frame 비율 최소. 미달 시 `body_not_fully_visible`.",
     )
     # §5-3 발 잘림
     foot_cutoff_y_max: float = Field(
