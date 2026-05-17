@@ -55,6 +55,7 @@ from choborunner_ai.config import (
 )
 from choborunner_ai.metrics.ic_detector import ICConfidence
 from choborunner_ai.pose_extractor import PoseLandmarks
+from choborunner_ai.result_serializer import AnalysisStatus
 
 logger = logging.getLogger(__name__)
 
@@ -1490,3 +1491,204 @@ def evaluate_tracking_stability(
                 severity=REASON_CODE_SEVERITY["background_person_interference"],
             ),
         ]
+
+
+# ============================================================
+# §6 status 분기 + §8-7 primary_reason_code 우선순위 (Phase 8-F SoT)
+# ============================================================
+
+
+REASON_CODE_PRIORITY: list[tuple[ReasonCode, "Severity"]] = [
+    # === failed 그룹 (1~5, docs §8-7-2) ===
+    # 그룹 1: 분석 대상자 추적 실패
+    # ⚠️ target_switch_detected (failed) — Phase 9 미구현 (scale 산출 정의 필요)
+    ("target_lost", "failed"),
+    # 그룹 2: 발 가시성 실패
+    ("foot_out_of_frame", "failed"),
+    ("foot_not_visible", "failed"),
+    # 그룹 3: 전신 가시성 실패
+    ("body_not_fully_visible", "failed"),
+    # 그룹 4: 측면 구도 실패 (invalid_view context-dependent failed 강도)
+    ("invalid_view", "failed"),
+    # 그룹 5: 메타데이터/IC 실패
+    # ⚠️ 메타데이터 3종 (too_short > low_resolution > low_fps) — docs/2-3-1 영역 미구현
+    ("insufficient_stride", "failed"),
+
+    # === low_confidence 그룹 (6~10, docs §8-7-3) ===
+    # 그룹 6: 추적 borderline
+    # ⚠️ unstable_landmark_sequence (low_confidence) — Phase 9 미구현 (mid-stance 정의 필요)
+    ("background_person_interference", "low_confidence"),
+    # 그룹 7: 측면 구도 borderline (invalid_view context-dependent low_confidence 강도)
+    ("invalid_view", "low_confidence"),
+    # 그룹 8: 일반 품질 저하
+    ("camera_unstable", "low_confidence"),
+    ("low_landmark_visibility", "low_confidence"),
+    ("lower_body_not_visible", "low_confidence"),
+    ("upper_body_not_visible", "low_confidence"),
+    # 그룹 9: IC 신뢰도 부족
+    ("low_ic_confidence", "low_confidence"),
+    ("insufficient_window", "low_confidence"),
+    # 그룹 10: 지표 변동성
+    ("unstable_foot_angle", "low_confidence"),
+    ("unstable_knee_angle", "low_confidence"),
+    ("unstable_trunk_angle", "low_confidence"),
+]
+"""docs/2-3-5 §8-7-2 + §8-7-3 primary_reason_code 우선순위 단일 정답 (Phase 8-F SoT).
+
+본 list는 docs §8-7-2 (failed 그룹 1~5) + §8-7-3 (low_confidence 그룹 6~10) 그룹
+우선순위 + 그룹 내 우선순위를 flat list로 구조화 — 17 entry.
+
+자료구조 채택 (Phase 8-F lock 8-F-2 α):
+- `list[tuple[ReasonCode, Severity]]` flat — `invalid_view` context-dependent 2 entry
+  (failed/low_confidence 별도). linear search 단순.
+- 그룹 1~5 = failed (위), 그룹 6~10 = low_confidence (아래) — docs §8-7-1 정합.
+
+그룹 내 우선순위 — docs §8-7-1 "사용자 즉시 해결 가능 코드 > 추상 코드":
+- 그룹 2: foot_out_of_frame ("카메라 멀리") > foot_not_visible ("발 안 보임")
+- 그룹 8: camera_unstable ("카메라 흔들림") > low_landmark_visibility ("신뢰도 낮음")
+  > lower_body_not_visible > upper_body_not_visible
+- 그룹 9: low_ic_confidence > insufficient_window
+- 그룹 10: foot > knee > trunk (지표 변동성)
+
+미등록 reason_code (lock 8-F-7 β YAGNI):
+- Phase 9 진입 시: target_switch_detected (그룹 1) / unstable_landmark_sequence (그룹 6)
+- 메타데이터 진입 시: too_short / low_resolution / low_fps (그룹 5 앞쪽)
+
+docs §8-7-4 5 예시 정합 (sanity/pytest 박힘):
+- foot_out_of_frame + foot_not_visible + low_landmark_visibility → foot_out_of_frame (그룹 2)
+- target_switch_detected + low_landmark_visibility → target_switch_detected (그룹 1) ⚠️ Phase 9
+- body_not_fully_visible + low_landmark_visibility → body_not_fully_visible (그룹 3)
+- unstable_foot + unstable_knee + low_ic_confidence → low_ic_confidence (그룹 9 > 10)
+- camera_unstable + unstable_landmark_sequence → unstable_landmark_sequence (그룹 6 > 8) ⚠️ Phase 9
+"""
+
+
+@dataclass(frozen=True)
+class ResponseStatusResult:
+    """docs/2-3-7 §6 status + docs §8-7 primary_reason_code 산출 결과.
+
+    Phase 8-F lock 8-F-5 α — dataclass 채택 (가독성 + 향후 확장 여지).
+    Phase 8-B-1 ReasonCodeEntry 패턴 일관 — frozen=True (불변 보장).
+
+    Phase 7-A AnalysisResultMessage schema 정합:
+    - status → `AnalysisResultMessage.status` (Literal['success', 'low_confidence', 'failed'])
+    - primary_reason_code → `AnalysisResultMessage.primary_reason_code` (Optional[str])
+    - reason_codes → `AnalysisResultMessage.reason_codes` (list[str])
+
+    Phase 8-I integration 시 Pipeline에서 사용:
+    1. evaluate_* 함수 호출 → list[ReasonCodeEntry] 누적
+    2. compute_response_status(entries) → ResponseStatusResult
+    3. AnalysisResultMessage 조립 (status/primary/reason_codes 필드 채움)
+
+    Phase 8-G feedback_engine 입력으로도 사용:
+    - status: docs/2-3-6 §3-4 status별 피드백 출력 정책 분기
+    - primary_reason_code: docs §8-3 system_info 메시지 매핑
+    - reason_codes: feedback context
+
+    Attributes:
+        status: 'success' / 'low_confidence' / 'failed'.
+        primary_reason_code: 사용자 노출 대표 reason code (1개). success 시 None.
+        reason_codes: dedup + PRIORITY 정렬된 reason_code list. success 시 빈 list.
+    """
+
+    status: AnalysisStatus
+    primary_reason_code: Optional[ReasonCode]
+    reason_codes: list[ReasonCode]
+
+
+def compute_response_status(
+    entries: list[ReasonCodeEntry],
+) -> ResponseStatusResult:
+    """누적 list[ReasonCodeEntry] → ResponseStatusResult 산출.
+
+    docs/2-3-5 §6 status 분기 + docs §8-7 primary_reason_code 우선순위 통합 산출.
+    Phase 8 묶음 중 가장 중요한 SoT 결정 — 발표 Q&A 핵심 답안지.
+
+    ⚠️ docs §6 status 분기 (3 단계 우선순위):
+    1. failed severity entry ≥ 1 → status='failed'
+    2. low_confidence severity entry ≥ 1 (failed 0) → status='low_confidence'
+    3. 빈 list → status='success' (모든 검사 통과)
+
+    ⚠️ docs §8-7 primary_reason_code 우선순위 (lock 8-F-2 α):
+    - `REASON_CODE_PRIORITY` linear search (17 entry 순회, lock 8-F-13)
+    - (reason_code, severity) 튜플 기반 — `invalid_view` context-dependent 정확 처리
+    - 그룹 1~5 failed > 그룹 6~10 low_confidence > 그룹 내 우선순위
+    - 빈 list → primary_reason_code=None
+
+    ⚠️ reason_codes 배열 (lock 8-F-3/4 α):
+    - dedup (set 변환, 중복 reason_code 제거 — invalid_view 2 severity 동시 트리거 시)
+    - PRIORITY 순서 정렬 (primary와 일관)
+    - 빈 list 가능 (success 시)
+
+    ⚠️ fallback 동작 (방어적, lock 8-F 미언급):
+    - PRIORITY 미등록 reason_code 입력 시 (현재 16 ReasonCode 모두 등록되어 발생 불가):
+      · primary: entries[0].reason_code fallback
+      · reason_codes: PRIORITY 정렬 후 미등록 코드 끝에 append
+    - Phase 9 + 메타데이터 진입 시 PRIORITY 확장으로 자연 해소
+
+    ⚠️ docs §8-7-4 5 예시 정합 (sanity/pytest 박힘 — 발표 Q&A 답안지):
+    예시 1: [foot_out_of_frame, foot_not_visible, low_landmark_visibility]
+            → primary=foot_out_of_frame (그룹 2 첫)
+    예시 2: [target_switch_detected, low_landmark_visibility] ⚠️ Phase 9
+            → primary=target_switch_detected (그룹 1)
+    예시 3: [body_not_fully_visible, low_landmark_visibility]
+            → primary=body_not_fully_visible (그룹 3)
+    예시 4: [unstable_foot_angle, unstable_knee_angle, low_ic_confidence]
+            → primary=low_ic_confidence (그룹 9 > 10)
+    예시 5: [camera_unstable, unstable_landmark_sequence] ⚠️ Phase 9
+            → primary=unstable_landmark_sequence (그룹 6 > 8)
+
+    Args:
+        entries: 누적 list[ReasonCodeEntry] (Phase 8-A~8-E 산출 + Pipeline integration).
+
+    Returns:
+        ResponseStatusResult — status / primary_reason_code / reason_codes.
+
+    견고성 가드: 빈 list → success 결과. PRIORITY 미등록 코드 fallback 처리.
+    """
+    # 빈 entries → success (lock 8-F-6)
+    if not entries:
+        return ResponseStatusResult(
+            status="success",
+            primary_reason_code=None,
+            reason_codes=[],
+        )
+
+    # ── docs §6 status 분기 (3 단계 우선순위) ─────────────
+    has_failed = any(e.severity == "failed" for e in entries)
+    status: AnalysisStatus = "failed" if has_failed else "low_confidence"
+
+    # ── docs §8-7 primary_reason_code linear search ─────
+    # entry set (code, severity) tuple — invalid_view context-dependent 정확 lookup
+    entry_set = {(e.reason_code, e.severity) for e in entries}
+
+    primary_reason_code: Optional[ReasonCode] = None
+    for code, sev in REASON_CODE_PRIORITY:
+        if (code, sev) in entry_set:
+            primary_reason_code = code
+            break
+    # fallback (방어적 — PRIORITY 미등록 reason_code 입력 시)
+    if primary_reason_code is None:
+        primary_reason_code = entries[0].reason_code
+
+    # ── reason_codes dedup + PRIORITY 정렬 (lock 8-F-3/4) ─
+    unique_codes = {e.reason_code for e in entries}
+    reason_codes: list[ReasonCode] = []
+    seen: set[ReasonCode] = set()
+    # PRIORITY 순서로 정렬 (등록된 코드)
+    for code, _sev in REASON_CODE_PRIORITY:
+        if code in unique_codes and code not in seen:
+            reason_codes.append(code)
+            seen.add(code)
+    # fallback (PRIORITY 미등록 코드는 끝에 append, 방어적)
+    for code in unique_codes:
+        if code not in seen:
+            reason_codes.append(code)
+            seen.add(code)
+
+    return ResponseStatusResult(
+        status=status,
+        primary_reason_code=primary_reason_code,
+        reason_codes=reason_codes,
+    )
+

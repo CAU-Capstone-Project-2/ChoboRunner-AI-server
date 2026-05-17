@@ -41,10 +41,13 @@ from choborunner_ai.config import (
 )
 from choborunner_ai.pose_extractor import Landmark, LandmarkPair, PoseLandmarks
 from choborunner_ai.quality_gate import (
+    REASON_CODE_PRIORITY,
     REASON_CODE_SEVERITY,
     FrameGeometryResult,
     FrameSideViewResult,
     ReasonCodeEntry,
+    ResponseStatusResult,
+    compute_response_status,
     evaluate_body_inclusion_accumulation,
     evaluate_camera_stability,
     evaluate_foot_cutoff_accumulation,
@@ -584,3 +587,112 @@ def test_tracking_stability_empty_and_fps_fallback(
     # fps=0 fallback to 30.0 (lock 8-E-14)
     out = evaluate_tracking_stability([0.9] * 30, 0.0, track_cfg)
     assert out == []  # 전체 0.9, trigger X (fallback 작동)
+
+
+# ============================================================
+# L. compute_response_status (§6 status + §8-7 primary, Phase 8-F SoT)
+# ============================================================
+
+
+def test_response_status_empty():
+    """빈 entries → success/None/[] (lock 8-F-6)."""
+    r = compute_response_status([])
+    assert r == ResponseStatusResult(
+        status="success", primary_reason_code=None, reason_codes=[]
+    )
+
+
+def test_response_status_failed_status():
+    """failed severity 1개 → status='failed' (docs §6 1순위)."""
+    r = compute_response_status([ReasonCodeEntry("foot_out_of_frame", "failed")])
+    assert r.status == "failed"
+    assert r.primary_reason_code == "foot_out_of_frame"
+
+
+def test_response_status_low_confidence_status():
+    """failed 0 + low_conf 1개 → status='low_confidence' (docs §6 2순위)."""
+    r = compute_response_status([
+        ReasonCodeEntry("camera_unstable", "low_confidence"),
+    ])
+    assert r.status == "low_confidence"
+    assert r.primary_reason_code == "camera_unstable"
+
+
+def test_response_status_docs_example_1_group_2():
+    """docs §8-7-4 예시 1: foot_out_of_frame + foot_not_visible + low_landmark_visibility
+    → primary=foot_out_of_frame (그룹 2 첫, 사용자 즉시 해결 가능 코드 우선)."""
+    r = compute_response_status([
+        ReasonCodeEntry("foot_out_of_frame", "failed"),
+        ReasonCodeEntry("foot_not_visible", "failed"),
+        ReasonCodeEntry("low_landmark_visibility", "low_confidence"),
+    ])
+    assert r.status == "failed"
+    assert r.primary_reason_code == "foot_out_of_frame"
+    # reason_codes PRIORITY 정렬: 그룹 2 foot_out > foot_not > 그룹 8 low_landmark
+    assert r.reason_codes == [
+        "foot_out_of_frame", "foot_not_visible", "low_landmark_visibility"
+    ]
+
+
+def test_response_status_docs_example_4_group_priority():
+    """docs §8-7-4 예시 4: unstable_foot + unstable_knee + low_ic_confidence
+    → primary=low_ic_confidence (그룹 9 > 그룹 10)."""
+    r = compute_response_status([
+        ReasonCodeEntry("unstable_foot_angle", "low_confidence"),
+        ReasonCodeEntry("unstable_knee_angle", "low_confidence"),
+        ReasonCodeEntry("low_ic_confidence", "low_confidence"),
+    ])
+    assert r.status == "low_confidence"
+    assert r.primary_reason_code == "low_ic_confidence"
+
+
+def test_response_status_invalid_view_dedup():
+    """invalid_view 2 severity 동시 트리거 → reason_codes dedup (lock 8-F-3 α).
+
+    catch Phase 8-B-2 γ 위임: invalid_view failed + low_confidence 동시 entry →
+    응답 메시지 reason_codes에 1번만 등장. severity 정보는 status (failed)에 반영.
+    primary는 그룹 4 (invalid_view failed) 우선.
+    """
+    r = compute_response_status([
+        ReasonCodeEntry("invalid_view", "failed"),
+        ReasonCodeEntry("invalid_view", "low_confidence"),
+        ReasonCodeEntry("camera_unstable", "low_confidence"),
+    ])
+    assert r.status == "failed"
+    assert r.primary_reason_code == "invalid_view"  # 그룹 4 (failed 우선)
+    assert r.reason_codes == ["invalid_view", "camera_unstable"]
+
+
+def test_response_status_priority_order_sort():
+    """reason_codes PRIORITY 순서 정렬 (lock 8-F-4 α).
+
+    입력 순서 무관 — PRIORITY list 순서 따라 정렬.
+    """
+    # 입력 순서: trunk → knee → foot → ic → camera (역순)
+    r = compute_response_status([
+        ReasonCodeEntry("unstable_trunk_angle", "low_confidence"),
+        ReasonCodeEntry("unstable_knee_angle", "low_confidence"),
+        ReasonCodeEntry("unstable_foot_angle", "low_confidence"),
+        ReasonCodeEntry("low_ic_confidence", "low_confidence"),
+        ReasonCodeEntry("camera_unstable", "low_confidence"),
+    ])
+    # PRIORITY 순서: 그룹 8 (camera) > 그룹 9 (low_ic) > 그룹 10 (foot > knee > trunk)
+    assert r.reason_codes == [
+        "camera_unstable", "low_ic_confidence",
+        "unstable_foot_angle", "unstable_knee_angle", "unstable_trunk_angle",
+    ]
+
+
+def test_response_status_priority_list_length():
+    """REASON_CODE_PRIORITY 길이 = 17 (16 ReasonCode + invalid_view 2 entry).
+
+    Phase 9 + 메타데이터 진입 시 PRIORITY 확장 anchor.
+    """
+    assert len(REASON_CODE_PRIORITY) == 17
+    # invalid_view 2 entry 확인
+    invalid_view_entries = [
+        (c, s) for c, s in REASON_CODE_PRIORITY if c == "invalid_view"
+    ]
+    assert len(invalid_view_entries) == 2
+    assert ("invalid_view", "failed") in invalid_view_entries
+    assert ("invalid_view", "low_confidence") in invalid_view_entries
