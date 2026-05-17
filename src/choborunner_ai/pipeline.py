@@ -35,11 +35,28 @@ from typing import Literal, Optional
 import numpy as np
 
 from choborunner_ai.config import AppConfig
-from choborunner_ai.pose_extractor import PoseExtractor
+from choborunner_ai.metrics import foot_strike, knee_flexion, trunk_lean
+from choborunner_ai.metrics.foot_strike import FootStrikeResult
+from choborunner_ai.metrics.ic_detector import ICConfidence, ICResult, compute_ic_indices
+from choborunner_ai.metrics.knee_flexion import KneeFlexionResult
+from choborunner_ai.metrics.trunk_lean import TrunkLeanResult
+from choborunner_ai.pose_extractor import PoseExtractor, PoseLandmarks
 from choborunner_ai.quality_gate import (
+    FrameGeometryResult,
+    FrameSideViewResult,
     FrameVisibilityResult,
-    ReasonCode,
+    ReasonCodeEntry,
+    evaluate_body_inclusion_accumulation,
+    evaluate_camera_stability,
+    evaluate_foot_cutoff_accumulation,
+    evaluate_frame_body_inclusion,
+    evaluate_frame_foot_cutoff,
+    evaluate_frame_side_view,
     evaluate_frame_visibility,
+    evaluate_ic_validation,
+    evaluate_metric_variability,
+    evaluate_side_view_accumulation,
+    evaluate_tracking_stability,
     evaluate_visibility_accumulation,
 )
 from choborunner_ai.video_preprocessor import (
@@ -58,27 +75,49 @@ logger = logging.getLogger(__name__)
 
 @dataclass(eq=False)
 class PipelineResult:
-    """file path mode 결과 객체.
+    """file path mode 결과 객체 (Phase 8-H 확장).
 
-    WebSocket binary stream mode는 별도 결과 객체 — Phase 8 진입 시 결정.
-    `eq=False`: ndarray 멤버는 현재 없지만 dataclass 일관성 + 향후 frame snapshot
-    추가 대비.
+    Phase 8-H 6 신규 필드 추가 — Phase 5 metrics + Phase 8-A~8-E reason_code 누적
+    보존. Phase 8-I (응답 조립) + Phase 8-J (pytest integration) 입력.
+
+    ⚠️ Phase 8-B-1 δ 잔재 해소 (lock 8-H-3 α):
+    - 기존 `accumulation_reasons: list[ReasonCode]` 필드 제거
+    - `reason_code_entries: list[ReasonCodeEntry]`로 통합 (Phase 8-A~8-E 모두 누적)
+    - Phase 8-B-1 commit 시 pipeline.py backport 누락 catch 해소
+
+    `eq=False`: ndarray + Optional[PoseLandmarks] 멤버 — dataclass 자동 __eq__
+    bool ambiguous error 회피.
 
     Attributes:
-        video_meta: 영상 메타데이터 (해상도, fps, duration 등 — video_preprocessor SoT).
-        frame_results: list[FrameVisibilityResult] (Phase 4-A 결과 누적).
-            pose_not_detected frame은 본 list에 포함 X — 모듈 경계, docs §4-2
-            "후속 단계가 분석 제외" 정책 정합.
-        accumulation_reasons: list[ReasonCode] (Phase 4-B 결과). 빈 list = 통과.
-        pose_landmarks_count: pose_detected=True frame 수 (디버깅 자산).
-            = len(frame_results) (pose 미검출 frame 제외).
-        pose_not_detected_count: pose 미검출 frame 수 (디버깅 자산, docs §4-2
-            누적이 별도 reason code trigger 가능성 — 별도 Phase에서 활용).
+        video_meta: 영상 메타데이터 (해상도, fps, duration 등).
+        frame_results: list[FrameVisibilityResult] (Phase 4-A §5-1 누적).
+            pose_not_detected frame은 본 list에 포함 X — 모듈 경계.
+        landmarks_series: list[PoseLandmarks | None] (Phase 8-H 신규).
+            전체 영상 frame 시퀀스 — pose 미검출은 None. Phase 5 metrics + Phase
+            8-C/8-D/8-E 입력. Phase 8-C anchor 해소.
+        ic_results: list[ICResult] (Phase 5-B-2 산출). compute_ic_indices 결과.
+            Phase 8-D anchor 해소 (`evaluate_ic_validation` 입력 ic_confidences 도출).
+        trunk_lean_results: list[TrunkLeanResult] (Phase 5-A 산출).
+            Phase 8-D anchor 해소 (trunk_window_valid_ratios 도출) + Phase 8-I
+            FeedbackContext 입력.
+        knee_flexion_results: list[KneeFlexionResult] (Phase 5-C 산출).
+        foot_strike_results: list[FootStrikeResult] (Phase 5-D 산출).
+        reason_code_entries: list[ReasonCodeEntry] (Phase 8-A~8-E 누적 통합).
+            §5-1 visibility + §5-2 body + §5-3 foot_cutoff + §5-4 side_view +
+            §5-5 camera_unstable + §5-6 metric_variability + §5-7 IC validation +
+            §4 tracking_stability. Phase 8-I `compute_response_status` 입력.
+        pose_landmarks_count: pose_detected=True frame 수 (= len(frame_results)).
+        pose_not_detected_count: pose 미검출 frame 수.
     """
 
     video_meta: VideoMeta
     frame_results: list[FrameVisibilityResult] = field(default_factory=list)
-    accumulation_reasons: list[ReasonCode] = field(default_factory=list)
+    landmarks_series: list[Optional[PoseLandmarks]] = field(default_factory=list)
+    ic_results: list[ICResult] = field(default_factory=list)
+    trunk_lean_results: list[TrunkLeanResult] = field(default_factory=list)
+    knee_flexion_results: list[KneeFlexionResult] = field(default_factory=list)
+    foot_strike_results: list[FootStrikeResult] = field(default_factory=list)
+    reason_code_entries: list[ReasonCodeEntry] = field(default_factory=list)
     pose_landmarks_count: int = 0
     pose_not_detected_count: int = 0
 
@@ -146,68 +185,129 @@ class Pipeline:
         frame: np.ndarray,
         timestamp_ms: int,
         analysis_side: Literal["left", "right"],
-    ) -> Optional[FrameVisibilityResult]:
-        """단일 frame 처리 — PoseExtractor.process_frame + evaluate_frame_visibility.
+    ) -> tuple[Optional[FrameVisibilityResult], Optional[PoseLandmarks]]:
+        """단일 frame 처리 — PoseExtractor + evaluate_frame_visibility (Phase 8-H 확장).
 
-        pose 미검출 시 (PoseLandmarks=None) **None 반환** — 호출자가 skip 결정
-        (docs §4-2 "후속 단계가 분석 제외" 정합). 본 frame은 누적 frame_results
-        에 포함 X. pose_not_detected 누적 카운트는 호출자(run_on_video_file)
-        가 별도 관리.
+        ⚠️ Phase 8-H lock 8-H-4 α — tuple 반환 (FrameVisibilityResult + PoseLandmarks):
+        호출자(run_on_video_file)가 landmarks_series 누적 — Phase 5 metrics + Phase
+        8-C/8-D/8-E 입력.
+
+        pose 미검출 시: `(None, None)` 반환. pose 검출 + visibility 평가 시:
+        `(FrameVisibilityResult, PoseLandmarks)`.
 
         Args:
-            frame: BGR np.ndarray (video_preprocessor 출력 형식).
-            timestamp_ms: 호출자 부여 timestamp (option C, monotonic + unique 보장).
+            frame: BGR np.ndarray.
+            timestamp_ms: 호출자 부여 timestamp.
             analysis_side: 'left' 또는 'right'.
 
         Returns:
-            FrameVisibilityResult (4 카테고리 평가 결과) 또는 None (pose 미검출).
+            tuple[Optional[FrameVisibilityResult], Optional[PoseLandmarks]]:
+            - pose 미검출: (None, None)
+            - pose 검출: (FrameVisibilityResult, PoseLandmarks)
         """
         pl = self._pose_extractor.process_frame(frame, timestamp_ms)
         if pl is None:
-            return None
-        return evaluate_frame_visibility(
+            return None, None
+        fvr = evaluate_frame_visibility(
             pl, analysis_side=analysis_side, cfg=self._cfg.visibility_check
         )
+        return fvr, pl
+
+    def _compute_visibility_per_frame(
+        self, landmarks_series: list[Optional[PoseLandmarks]]
+    ) -> list[float]:
+        """각 frame의 주요 12 LandmarkPair visibility 평균 (Phase 8-E §4 입력).
+
+        ⚠️ §5-1 overall_avg 패턴 일관 (12점 평균, lock 8-E-5 δ + 8-H-11).
+        None frame은 visibility=0.0 처리 (target_lost 시그널 자연).
+        """
+        out: list[float] = []
+        for pl in landmarks_series:
+            if pl is None:
+                out.append(0.0)
+                continue
+            vis_sum = (
+                pl.shoulder.left.visibility + pl.shoulder.right.visibility
+                + pl.hip.left.visibility + pl.hip.right.visibility
+                + pl.knee.left.visibility + pl.knee.right.visibility
+                + pl.ankle.left.visibility + pl.ankle.right.visibility
+                + pl.heel.left.visibility + pl.heel.right.visibility
+                + pl.foot_index.left.visibility + pl.foot_index.right.visibility
+            )
+            out.append(vis_sum / 12.0)
+        return out
+
+    @staticmethod
+    def _extract_ic_confidences(
+        ic_results: list[ICResult],
+    ) -> list[ICConfidence]:
+        """ICResult list → list[ICConfidence] (Phase 8-D evaluate_ic_validation 입력)."""
+        return [r.confidence for r in ic_results]
+
+    @staticmethod
+    def _extract_trunk_window_ratios(
+        trunk_lean_results: list[TrunkLeanResult],
+    ) -> list[float]:
+        """TrunkLeanResult.window_valid_count / window_total_count 산출 (Phase 8-D 입력).
+
+        ⚠️ window_total_count=0 (영상 경계) 가드: ratio=0.0 fallback (Phase 8-D
+        catch 7-4 정합).
+        """
+        out: list[float] = []
+        for r in trunk_lean_results:
+            if r.window_total_count <= 0:
+                out.append(0.0)  # ZeroDivisionError 가드
+            else:
+                out.append(r.window_valid_count / r.window_total_count)
+        return out
 
     def run_on_video_file(
         self,
         video_path: Path,
         analysis_side: Literal["left", "right"],
         max_frames: Optional[int] = None,
+        direction: Literal["left_to_right", "right_to_left"] = "left_to_right",
     ) -> PipelineResult:
-        """file path mode end-to-end (Phase 6-B).
+        """file path mode end-to-end (Phase 8-H 확장 — Phase 5 metrics + Phase 8-A~8-E 통합).
 
-        절차:
-        1. `video_preprocessor.get_video_meta(video_path)` → VideoMeta 보관
-        2. `iter_frames(video_path)` iterate, 각 frame 별로 헬퍼 호출:
-           - timestamp_ms = int(frame_index * 1000 / fps) (option C, 호출자 부여)
-           - 헬퍼 None 반환 시 `pose_not_detected_count += 1`, skip
-           - FrameVisibilityResult 반환 시 frame_results.append
-           - max_frames 도달 시 break
-        3. `evaluate_visibility_accumulation(frame_results, cfg.visibility_check)`
-           → accumulation_reasons
-        4. PipelineResult 조립 + 반환
+        ⚠️ Phase 8-H 통합 흐름:
+        1. video_meta + frame loop (Phase 5/8 통합 산출물 누적)
+        2. §5-1/§5-2/§5-3/§5-4 frame-level + 누적
+        3. Phase 5 metrics: compute_ic_indices + trunk_lean/knee_flexion/foot_strike compute_at_ic
+        4. Phase 8-C §5-5 evaluate_camera_stability
+        5. Phase 8-C §5-6 evaluate_metric_variability
+        6. Phase 8-D §5-7 evaluate_ic_validation
+        7. Phase 8-E §4 evaluate_tracking_stability (visibility_per_frame helper)
+        8. reason_code_entries 누적 → PipelineResult 조립
+
+        ⚠️ Phase 8-I (응답 조립) scope:
+        compute_response_status + compute_feedback_messages + AnalysisResultMessage 조립.
+        본 8-H는 reason_code_entries 누적까지만.
+
+        ⚠️ direction (lock catch 7-12): 'left_to_right' default. jaemin 영상 기준.
+        Phase 9 자동 결정 anchor (docs §3-1 1.5초 AND 30 frame 정책).
+
+        ⚠️ analysis_side (lock 8-H-6): 호출자 입력 그대로 (현재 CLI default 'left',
+        Phase 9 자동 결정 anchor).
 
         Args:
             video_path: 영상 파일 경로.
-            analysis_side: 'left' 또는 'right'. CLI 임시 default 'left'
-                (Phase 6 decision 2, 본격 결정은 별도 Phase).
-            max_frames: 처리할 최대 frame 수 (시연 자산 가치, 빠른 PoC).
-                None이면 full run.
+            analysis_side: 'left' 또는 'right'.
+            max_frames: 처리할 최대 frame 수 (None이면 full run).
+            direction: 'left_to_right' 또는 'right_to_left' (foot_strike compute_at_ic 입력).
 
         Returns:
-            PipelineResult — video_meta + frame_results + accumulation_reasons
-            + pose_landmarks_count + pose_not_detected_count.
+            PipelineResult — 확장 schema 전부 채움.
 
         Raises:
-            FileNotFoundError: video_path 미존재 (`get_video_meta`가 전파).
-            ValueError: `max_frames <= 0` (None 허용).
+            FileNotFoundError: video_path 미존재.
+            ValueError: max_frames <= 0.
 
         견고성 가드:
-        - max_frames 음수/0 → ValueError (None만 허용)
-        - fps ≤ 1e-6 (비정상 영상) → 30fps 안전 default 적용
-        - iter_frames 중 frame 단위 예외 → logger.exception + skip
-          (개별 frame 실패가 전체 분석 무효화 X, 누적 결과 반환)
+        - max_frames 음수/0 → ValueError
+        - fps ≤ 1e-6 → 30fps fallback
+        - frame 단위 예외 → logger.exception + skip
+        - Phase 5/8 함수 호출 예외 → 각 함수 내부 failed-safe (logger.exception 적용)
         """
         if max_frames is not None and max_frames <= 0:
             raise ValueError(
@@ -218,34 +318,140 @@ class Pipeline:
         fps_safe = video_meta.fps if video_meta.fps > 1e-6 else 30.0
 
         frame_results: list[FrameVisibilityResult] = []
+        landmarks_series: list[Optional[PoseLandmarks]] = []
+        body_inclusion_results: list[FrameGeometryResult] = []
+        foot_cutoff_results: list[FrameGeometryResult] = []
+        side_view_results: list[FrameSideViewResult] = []
         pose_not_detected_count = 0
 
+        # ── 1. frame loop (Phase 6 + Phase 8-A/8-B-2 frame-level 통합) ──
         for idx, frame in enumerate(iter_frames(video_path)):
             if max_frames is not None and idx >= max_frames:
                 break
             timestamp_ms = int(idx * 1000.0 / fps_safe)
             try:
-                r = self._extract_and_evaluate_one_frame(
+                fvr, pl = self._extract_and_evaluate_one_frame(
                     frame, timestamp_ms, analysis_side
                 )
             except Exception:
                 logger.exception(
                     "run_on_video_file: frame %d 처리 예외 (swallow, skip)", idx
                 )
-                continue
-            if r is None:
+                landmarks_series.append(None)
                 pose_not_detected_count += 1
-            else:
-                frame_results.append(r)
+                continue
 
-        accumulation_reasons = evaluate_visibility_accumulation(
-            frame_results, self._cfg.visibility_check
+            # landmarks_series 누적 (Phase 8-C anchor 해소)
+            landmarks_series.append(pl)
+
+            if fvr is None:
+                pose_not_detected_count += 1
+                continue
+
+            frame_results.append(fvr)
+
+            # §5-2 body 포함 + §5-3 발 잘림 (lock 8-H-8)
+            body_inclusion_results.append(
+                evaluate_frame_body_inclusion(pl, self._cfg.visibility_check)
+            )
+            foot_cutoff_results.append(
+                evaluate_frame_foot_cutoff(pl, analysis_side, self._cfg.visibility_check)
+            )
+
+            # §5-4 측면 구도 (lock 8-H-9)
+            side_view_results.append(
+                evaluate_frame_side_view(pl, self._cfg.side_view)
+            )
+
+        # ── 2. §5-1/§5-2/§5-3/§5-4 누적 평가 → reason_code_entries ──
+        reason_code_entries: list[ReasonCodeEntry] = []
+        reason_code_entries.extend(
+            evaluate_visibility_accumulation(
+                frame_results, self._cfg.visibility_check
+            )
+        )
+        reason_code_entries.extend(
+            evaluate_body_inclusion_accumulation(
+                body_inclusion_results, self._cfg.visibility_check
+            )
+        )
+        reason_code_entries.extend(
+            evaluate_foot_cutoff_accumulation(
+                foot_cutoff_results, self._cfg.visibility_check
+            )
+        )
+        reason_code_entries.extend(
+            evaluate_side_view_accumulation(
+                side_view_results, self._cfg.side_view
+            )
         )
 
+        # ── 3. Phase 5 metrics (lock 8-H-10) ──
+        ic_results: list[ICResult] = compute_ic_indices(
+            landmarks_series, analysis_side, self._cfg.ic
+        )
+        ic_indices = [r.frame_index for r in ic_results]
+
+        trunk_lean_results: list[TrunkLeanResult] = trunk_lean.compute_at_ic(
+            landmarks_series, ic_indices, self._cfg.trunk_lean
+        )
+        knee_flexion_results: list[KneeFlexionResult] = knee_flexion.compute_at_ic(
+            landmarks_series, ic_indices, analysis_side, self._cfg.knee_flexion
+        )
+        foot_strike_results: list[FootStrikeResult] = foot_strike.compute_at_ic(
+            landmarks_series,
+            ic_indices,
+            analysis_side,
+            direction,
+            self._cfg.foot_strike,
+        )
+
+        # ── 4. Phase 8-C §5-5 camera_unstable (lock 8-H-10) ──
+        reason_code_entries.extend(
+            evaluate_camera_stability(
+                landmarks_series, ic_indices, self._cfg.stride_exclusion
+            )
+        )
+
+        # ── 5. Phase 8-C §5-6 metric_variability ──
+        foot_degs = [r.deg for r in foot_strike_results]
+        knee_degs = [r.deg for r in knee_flexion_results]
+        trunk_degs = [r.deg for r in trunk_lean_results]
+        reason_code_entries.extend(
+            evaluate_metric_variability(
+                foot_degs, knee_degs, trunk_degs, self._cfg.variability
+            )
+        )
+
+        # ── 6. Phase 8-D §5-7 IC 검증 ──
+        ic_confidences = self._extract_ic_confidences(ic_results)
+        trunk_window_valid_ratios = self._extract_trunk_window_ratios(
+            trunk_lean_results
+        )
+        reason_code_entries.extend(
+            evaluate_ic_validation(
+                ic_confidences, trunk_window_valid_ratios, self._cfg.ic_validation
+            )
+        )
+
+        # ── 7. Phase 8-E §4 추적 안정성 (lock 8-H-11) ──
+        visibility_per_frame = self._compute_visibility_per_frame(landmarks_series)
+        reason_code_entries.extend(
+            evaluate_tracking_stability(
+                visibility_per_frame, fps_safe, self._cfg.tracking
+            )
+        )
+
+        # ── 8. PipelineResult 조립 (확장 schema) ──
         return PipelineResult(
             video_meta=video_meta,
             frame_results=frame_results,
-            accumulation_reasons=accumulation_reasons,
+            landmarks_series=landmarks_series,
+            ic_results=ic_results,
+            trunk_lean_results=trunk_lean_results,
+            knee_flexion_results=knee_flexion_results,
+            foot_strike_results=foot_strike_results,
+            reason_code_entries=reason_code_entries,
             pose_landmarks_count=len(frame_results),
             pose_not_detected_count=pose_not_detected_count,
         )

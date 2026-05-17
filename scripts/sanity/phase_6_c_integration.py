@@ -165,16 +165,17 @@ def main() -> int:
         print("[카테고리 평균] N/A (frame_results 빈 list)")
     print()
 
-    # accumulation
-    print("[Accumulation 결과]")
-    print(f"  final reason codes  : {result.accumulation_reasons}")
-    if not result.accumulation_reasons:
-        print("  accumulation 판정    : PASS (visibility 누적 통과)")
+    # accumulation (Phase 8-H — accumulation_reasons → reason_code_entries 통합)
+    # ⚠️ Phase 8-H lock 8-H-3 α: Phase 8-B-1 δ 시그니처 잔재 해소.
+    #   기존 list[ReasonCode] 단일 §5-1 필드 → list[ReasonCodeEntry] 통합
+    #   (§5-1~§5-7 + §4 모두 누적).
+    print("[Reason Code Entries (Phase 8-A~8-E 누적)]")
+    if not result.reason_code_entries:
+        print("  판정: PASS (모든 reason code 통과)")
     else:
-        print(
-            f"  accumulation 판정    : FAIL "
-            f"({', '.join(result.accumulation_reasons)})"
-        )
+        print(f"  entry count: {len(result.reason_code_entries)}")
+        for entry in result.reason_code_entries:
+            print(f"    - {entry.reason_code} ({entry.severity})")
     print()
 
     # elapsed
@@ -195,9 +196,9 @@ def main() -> int:
         )
         return 1
     print("PASS: Pipeline end-to-end 동작 확인")
-    if result.accumulation_reasons:
+    if result.reason_code_entries:
         print(
-            "  (accumulation FAIL이지만 sanity 자체는 '동작 확인'이라 PASS - "
+            "  (reason code entries 누적되었지만 sanity 자체는 '동작 확인'이라 PASS - "
             "임계값 보정 필요 신호일 수 있음)"
         )
     return 0
