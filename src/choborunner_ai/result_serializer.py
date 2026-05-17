@@ -43,13 +43,22 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional, TypeVar
 
 import numpy as np
 from pydantic import BaseModel, Field
 
-from choborunner_ai.metrics.foot_strike import FootStrikeClassification
+from choborunner_ai.metrics.foot_strike import FootStrikeClassification, FootStrikeResult
 from choborunner_ai.video_preprocessor import VideoMeta as Phase6VideoMeta
+
+# ⚠️ Circular import 회피 (Phase 8-I, catch):
+# - result_serializer → feedback_engine → result_serializer (FeedbackMessage 등) cycle
+# - result_serializer → quality_gate → result_serializer (AnalysisStatus) cycle
+# - pipeline → result_serializer (AnalysisResultMessage)
+# → build_analysis_result 함수 내부에서 lazy import (feedback_engine + quality_gate)
+# → PipelineResult는 TYPE_CHECKING으로 type hint만 (runtime import X)
+if TYPE_CHECKING:
+    from choborunner_ai.pipeline import PipelineResult
 
 
 # ============================================================
@@ -346,3 +355,246 @@ def convert_phase6_video_meta(meta: Phase6VideoMeta) -> VideoMeta:
         resolution=Resolution(width=meta.width, height=meta.height),
         total_frames=meta.frame_count,
     )
+
+
+# ============================================================
+# Phase 8-I helpers — FeedbackContext 산출 + AnalysisResultMessage 조립
+# ============================================================
+
+
+_TClassification = TypeVar("_TClassification")
+
+
+def compute_classification_dominant(
+    classifications: list[Optional[_TClassification]],
+) -> Optional[_TClassification]:
+    """Generic mode 산출 — list[Optional[Classification]] → mode (None 제외).
+
+    Phase 7-A `compute_fsp_dominant` 패턴 일관 (lock 8-I-4 α). trunk_lean /
+    knee_flexion 두 metric 모두 활용 (Generic TypeVar).
+
+    Args:
+        classifications: list[Optional[Classification]] (Phase 5 dataclass
+            .classification 추출).
+
+    Returns:
+        가장 빈도 높은 classification (None 제외). 모두 None 또는 빈 list → None.
+    """
+    valid = [c for c in classifications if c is not None]
+    if not valid:
+        return None
+    counter = Counter(valid)
+    dominant, _count = counter.most_common(1)[0]
+    return dominant
+
+
+def compute_uncertain_stride_count(
+    foot_strike_results: list[FootStrikeResult],
+) -> int:
+    """foot_strike classification=None count (Phase 8-G UNCERTAIN_STRIDE_THRESHOLD 비교)."""
+    return sum(1 for r in foot_strike_results if r.classification is None)
+
+
+def _build_quality_summary(
+    pipeline_result: "PipelineResult",
+    reason_code_entries: list,
+) -> QualitySummary:
+    """QualitySummary 산출 — 5 필드 (lock 8-I-6/7).
+
+    ⚠️ catch 7-9 — valid_frame_ratio docs §5-5 (2) frame_quality_flags 미적용
+    (Phase 7-A 응답 schema 정합 후속 anchor).
+
+    ⚠️ valid_stride_count: min(3 metric.n_strides) 가장 보수 (lock 8-I-6 α).
+    metric.n_strides는 AngleStats.n_strides — NaN 제외 카운트.
+
+    ⚠️ target_tracking_stability: docs §4 entries 기반 (lock 8-I-7 α).
+    Phase 9 sliding window 추가 신호 anchor.
+    """
+    total_frames = len(pipeline_result.landmarks_series)
+    # valid_frame_ratio: pose_detected + visibility 통과 (frame_results = valid)
+    # docs §5-5 (2) frame_quality_flags 미적용 — 후속 anchor
+    valid_count = pipeline_result.pose_landmarks_count
+    valid_frame_ratio = valid_count / total_frames if total_frames > 0 else 0.0
+
+    # valid_stride_count: min(3 metric stride 산출 가능 수)
+    foot_valid = sum(1 for r in pipeline_result.foot_strike_results if r.is_valid)
+    knee_valid = sum(1 for r in pipeline_result.knee_flexion_results if r.is_valid)
+    trunk_valid = sum(1 for r in pipeline_result.trunk_lean_results if r.is_valid)
+    valid_stride_count = min(foot_valid, knee_valid, trunk_valid)
+
+    # landmark_visibility_avg: 12 LandmarkPair visibility 평균 (전체 frame, None=0.0)
+    vis_sum = 0.0
+    vis_n = 0
+    for pl in pipeline_result.landmarks_series:
+        if pl is None:
+            continue
+        vis_sum += (
+            pl.shoulder.left.visibility + pl.shoulder.right.visibility
+            + pl.hip.left.visibility + pl.hip.right.visibility
+            + pl.knee.left.visibility + pl.knee.right.visibility
+            + pl.ankle.left.visibility + pl.ankle.right.visibility
+            + pl.heel.left.visibility + pl.heel.right.visibility
+            + pl.foot_index.left.visibility + pl.foot_index.right.visibility
+        ) / 12.0
+        vis_n += 1
+    landmark_visibility_avg = vis_sum / vis_n if vis_n > 0 else 0.0
+    # clip [0, 1] — Pydantic Field 가드
+    landmark_visibility_avg = max(0.0, min(1.0, landmark_visibility_avg))
+
+    # target_tracking_stability: docs §4 entries 기반 (Phase 8-E scope γ 정합)
+    # ⚠️ Phase 9 sliding window 추가 신호 (target_switch / unstable_landmark) anchor
+    target_tracking_stability: TrackingStability = "stable"
+    for entry in reason_code_entries:
+        if entry.reason_code == "target_lost":
+            target_tracking_stability = "unstable"
+            break
+        if entry.reason_code == "background_person_interference":
+            target_tracking_stability = "borderline"
+
+    return QualitySummary(
+        valid_frame_ratio=max(0.0, min(1.0, valid_frame_ratio)),
+        ic_candidate_count=len(pipeline_result.ic_results),
+        valid_stride_count=valid_stride_count,
+        landmark_visibility_avg=landmark_visibility_avg,
+        target_tracking_stability=target_tracking_stability,
+    )
+
+
+def build_analysis_result(
+    pipeline_result: "PipelineResult",
+    analysis_side: AnalysisSide,
+) -> "AnalysisResultMessage":
+    """Phase 8-A~8-H 산출물 → AnalysisResultMessage 조립 (Phase 8-I lock 8-I-1 α).
+
+    ⚠️ Circular import 회피 (lock 8-I-2 α):
+    feedback_engine + quality_gate를 함수 내부 lazy import.
+
+    ⚠️ status 분기 (docs §5-5 정합, lock 8-I-9):
+    - 'failed': video_meta + primary + reason_codes + message만, 나머지 None
+    - 'low_confidence' / 'success': 전체 필드 (status별 confidence_prefix 적용은
+      feedback_messages 내부)
+
+    ⚠️ message 필드 (lock 8-I-8):
+    - low_confidence / failed → REASON_CODE_USER_MESSAGES[primary] 매핑
+    - success → None
+
+    Args:
+        pipeline_result: PipelineResult (Phase 8-H 확장 schema 6 신규 필드 보유).
+        analysis_side: 'left' 또는 'right' (호출자 입력, Pipeline 시그니처 정합).
+
+    Returns:
+        AnalysisResultMessage — 12 필드 채움 (status별 분기).
+    """
+    # ⚠️ Lazy import (circular 회피)
+    from choborunner_ai.feedback_engine import (
+        REASON_CODE_USER_MESSAGES,
+        FeedbackContext,
+        compute_feedback_messages,
+    )
+    from choborunner_ai.quality_gate import compute_response_status
+
+    # 1. compute_response_status (Phase 8-F)
+    rs = compute_response_status(pipeline_result.reason_code_entries)
+
+    # 2. video_meta 변환
+    video_meta = convert_phase6_video_meta(pipeline_result.video_meta)
+
+    # 3. message 산출
+    message = (
+        REASON_CODE_USER_MESSAGES.get(rs.primary_reason_code)
+        if rs.primary_reason_code is not None
+        else None
+    )
+
+    # ── status='failed' 분기: metrics 등 제외 ──
+    if rs.status == "failed":
+        return AnalysisResultMessage(
+            status="failed",
+            video_meta=video_meta,
+            analysis_side=None,
+            metrics=None,
+            metric_details=None,
+            quality_summary=None,
+            primary_reason_code=rs.primary_reason_code,
+            reason_codes=rs.reason_codes,
+            message=message,
+            feedback_messages=None,
+        )
+
+    # ── success / low_confidence: 전체 필드 ──
+    # 4. AngleStats 3 metric (NaN 자동 제외 — compute_angle_stats 내부)
+    foot_stats = compute_angle_stats(
+        [r.deg for r in pipeline_result.foot_strike_results]
+    )
+    knee_stats = compute_angle_stats(
+        [r.deg for r in pipeline_result.knee_flexion_results]
+    )
+    trunk_stats = compute_angle_stats(
+        [r.deg for r in pipeline_result.trunk_lean_results]
+    )
+
+    # 5. dominant (foot UPPER + trunk/knee mode)
+    foot_dominant_upper, _ratio, _dist = compute_fsp_dominant(
+        [r.classification for r in pipeline_result.foot_strike_results]
+    )
+    trunk_dominant = compute_classification_dominant(
+        [r.classification for r in pipeline_result.trunk_lean_results]
+    )
+    knee_dominant = compute_classification_dominant(
+        [r.classification for r in pipeline_result.knee_flexion_results]
+    )
+    uncertain_count = compute_uncertain_stride_count(
+        pipeline_result.foot_strike_results
+    )
+
+    # 6. FeedbackContext build + compute_feedback_messages (Phase 8-G)
+    ctx = FeedbackContext(
+        status=rs.status,
+        primary_reason_code=rs.primary_reason_code,
+        trunk_classification=trunk_dominant,
+        knee_classification=knee_dominant,
+        foot_dominant=foot_dominant_upper,
+        foot_iqr=(foot_stats.iqr[0], foot_stats.iqr[1]) if foot_stats.n_strides > 0 else None,
+        knee_iqr=(knee_stats.iqr[0], knee_stats.iqr[1]) if knee_stats.n_strides > 0 else None,
+        trunk_iqr=(trunk_stats.iqr[0], trunk_stats.iqr[1]) if trunk_stats.n_strides > 0 else None,
+        uncertain_stride_count=uncertain_count,
+    )
+    feedback_messages = compute_feedback_messages(ctx)
+
+    # 7. QualitySummary
+    quality_summary = _build_quality_summary(
+        pipeline_result, pipeline_result.reason_code_entries
+    )
+
+    # 8. Metrics (foot_dominant이 None이면 Metrics 조립 불가 — fallback 'MFS' default)
+    # ⚠️ Metrics.foot_strike_pattern은 non-Optional. dominant=None 시 metric 자체 None
+    if foot_dominant_upper is None:
+        # 모든 stride Uncertain — metrics 조립 불가
+        metrics = None
+        metric_details = None
+    else:
+        metrics = Metrics(
+            foot_strike_pattern=foot_dominant_upper,
+            foot_strike_angle_deg=foot_stats.median,
+            initial_knee_flexion_deg=knee_stats.median,
+            trunk_lean_deg=trunk_stats.median,
+        )
+        metric_details = MetricDetails(
+            foot_strike_angle_deg=foot_stats,
+            initial_knee_flexion_deg=knee_stats,
+            trunk_lean_deg=trunk_stats,
+        )
+
+    return AnalysisResultMessage(
+        status=rs.status,
+        video_meta=video_meta,
+        analysis_side=analysis_side,
+        metrics=metrics,
+        metric_details=metric_details,
+        quality_summary=quality_summary,
+        primary_reason_code=rs.primary_reason_code,
+        reason_codes=rs.reason_codes,
+        message=message,
+        feedback_messages=feedback_messages if feedback_messages else None,
+    )
+

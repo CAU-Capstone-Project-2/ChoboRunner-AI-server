@@ -59,6 +59,10 @@ from choborunner_ai.quality_gate import (
     evaluate_tracking_stability,
     evaluate_visibility_accumulation,
 )
+from choborunner_ai.result_serializer import (
+    AnalysisResultMessage,
+    build_analysis_result,
+)
 from choborunner_ai.video_preprocessor import (
     VideoMeta,
     get_video_meta,
@@ -118,6 +122,13 @@ class PipelineResult:
     knee_flexion_results: list[KneeFlexionResult] = field(default_factory=list)
     foot_strike_results: list[FootStrikeResult] = field(default_factory=list)
     reason_code_entries: list[ReasonCodeEntry] = field(default_factory=list)
+    analysis_result: Optional[AnalysisResultMessage] = None
+    """Phase 8-I lock 8-I-3 γ — AnalysisResultMessage 응답 조립 결과.
+
+    Pipeline.run_on_video_file 마지막 단계에서 `build_analysis_result` 호출 →
+    본 필드 채움. 디버깅 자산 (frame_results / landmarks_series 등) + 응답
+    (analysis_result) 둘 다 보존 (lock 8-I-3 γ).
+    """
     pose_landmarks_count: int = 0
     pose_not_detected_count: int = 0
 
@@ -443,7 +454,7 @@ class Pipeline:
         )
 
         # ── 8. PipelineResult 조립 (확장 schema) ──
-        return PipelineResult(
+        result = PipelineResult(
             video_meta=video_meta,
             frame_results=frame_results,
             landmarks_series=landmarks_series,
@@ -455,3 +466,7 @@ class Pipeline:
             pose_landmarks_count=len(frame_results),
             pose_not_detected_count=pose_not_detected_count,
         )
+
+        # ── 9. Phase 8-I 응답 조립 (lock 8-I-3 γ — PipelineResult.analysis_result 필드) ──
+        result.analysis_result = build_analysis_result(result, analysis_side)
+        return result
