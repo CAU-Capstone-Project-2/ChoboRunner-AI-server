@@ -41,9 +41,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 
-from choborunner_ai.config import SideViewConfig, VisibilityCheckConfig
+import numpy as np
+
+from choborunner_ai.config import (
+    MetricVariabilityConfig,
+    SideViewConfig,
+    StrideExclusionConfig,
+    VisibilityCheckConfig,
+)
 from choborunner_ai.pose_extractor import PoseLandmarks
 
 logger = logging.getLogger(__name__)
@@ -65,6 +72,11 @@ ReasonCode = Literal[
     "foot_out_of_frame",
     # §5-4 측면 구도 (Phase 8-B-2) — context-dependent 2 severity
     "invalid_view",
+    # §5-5 카메라 흔들림 / §5-6 지표 변동성 (Phase 8-C, stride-level)
+    "camera_unstable",
+    "unstable_foot_angle",
+    "unstable_knee_angle",
+    "unstable_trunk_angle",
 ]
 """docs/2-3-5 §8-2/§8-3 visibility/geometry/side-view 카테고리 reason code 7종.
 
@@ -101,6 +113,11 @@ REASON_CODE_SEVERITY: dict[ReasonCode, Severity] = {
     # §5-4 (Phase 8-B-2) — context-dependent. default 'failed' (β 채택, 더 심각한
     # 케이스 default). 산출 함수가 context (frame ratio)로 override 가능.
     "invalid_view": "failed",
+    # §5-5 / §5-6 (Phase 8-C, stride-level) — docs §8-6 표 모두 low_confidence
+    "camera_unstable": "low_confidence",
+    "unstable_foot_angle": "low_confidence",
+    "unstable_knee_angle": "low_confidence",
+    "unstable_trunk_angle": "low_confidence",
 }
 """docs §8-2 visibility/geometry reason code **기본/default** severity 사전.
 
@@ -954,4 +971,222 @@ def evaluate_side_view_accumulation(
                 severity=REASON_CODE_SEVERITY["invalid_view"],
             )
         ]
+
+
+# ============================================================
+# §5-5 카메라 흔들림 stride-level 평가 (Phase 8-C)
+# ============================================================
+
+
+def evaluate_camera_stability(
+    landmarks_series: list[Optional[PoseLandmarks]],
+    ic_indices: list[int],
+    cfg: StrideExclusionConfig,
+) -> list[ReasonCodeEntry]:
+    """stride-level 카메라 흔들림 평가 (docs/2-3-5 §5-5 + docs/2-3-4 §10).
+
+    각 stride 구간 [IC[n], IC[n+1]-1] frame들의 pelvis_x 변동을 산출, 임계 초과
+    stride가 1개라도 있으면 `camera_unstable` (low_confidence) 트리거.
+
+    docs 정합:
+    - docs/2-3-5 §5-5: "pelvis_x의 stride 평균 대비 변동 ±30% 이내" → 위반 시
+      `camera_unstable` 트리거 (low_confidence)
+    - docs/2-3-4 §10 표: "pelvis_x 변동이 stride 평균 ±30% 이상" → "해당 stride 제외"
+      + "camera_unstable 트리거 신호" (stride 제외 처리는 Phase 8-I integration 책임)
+
+    ⚠️ docs §5-5 인용 catch (5-1): 본문 "2-3-4 문서 9장 기준 인용"은 잘못된 인용
+    (실제 §10 표). docs 보강 후보.
+
+    ⚠️ pelvis_x 변동 산출 방식 (lock 8-C-2 α — config docstring "stride 평균 대비
+    변동" 직역):
+        variation_ratio = (max(pelvis_x_in_stride) - min(pelvis_x_in_stride))
+                          / mean(pelvis_x_in_stride)
+    peak-to-peak ratio. docs 명시 부족, β(절대 폭) / γ(stddev/mean)도 가능 —
+    파일럿 데이터 보정 후보.
+
+    ⚠️ 산출 정책 (lock 8-C-1 α): 5 stride 중 1개라도 위반 → camera_unstable 트리거.
+    docs §10 "해당 stride 제외 + 신호" 직역. 파일럿 5~10영상 후 β (비율 임계)
+    전환 검토 후보.
+
+    Args:
+        landmarks_series: list[PoseLandmarks | None] (Phase 6 흐름 정합, None
+            frame skip — lock catch 5-11 β).
+        ic_indices: list[int] (compute_ic_indices 결과의 frame_index 추출 — 본
+            함수는 ICResult가 아닌 단순 frame_index list만 받음).
+        cfg: StrideExclusionConfig.
+            - `camera_pelvis_x_stride_variation_max` (default 0.30)
+
+    Returns:
+        list[ReasonCodeEntry]:
+        - 모든 stride 정상 또는 ic_indices 길이 < 2 → `[]`
+        - 1개 이상 stride 위반 → `[ReasonCodeEntry('camera_unstable', 'low_confidence')]`
+
+    ⚠️ Phase 8-I integration anchor: 본 함수는 landmarks_series 입력 받음. Phase 6
+    PipelineResult는 현재 raw landmarks 미보존 (frame_results만). Phase 8-I 진입
+    시 PipelineResult.landmarks_series 필드 추가 필요.
+
+    견고성 가드:
+    - ic_indices 길이 < 2 → 빈 list 반환 (stride 1개 미만)
+    - stride 구간 내 None frame skip
+    - stride frame 0개 또는 mean=0 → 해당 stride skip
+    - 평가 예외 → failed-safe (camera_unstable entry 반환)
+    """
+    try:
+        if len(ic_indices) < 2:
+            return []
+
+        for stride_idx in range(len(ic_indices) - 1):
+            start = ic_indices[stride_idx]
+            end = ic_indices[stride_idx + 1]  # IC[n+1] frame 미포함 (range)
+
+            # stride 구간 frame의 pelvis_x (None skip)
+            pelvis_x_list: list[float] = []
+            for frame_idx in range(start, end):
+                if frame_idx < 0 or frame_idx >= len(landmarks_series):
+                    continue
+                pl = landmarks_series[frame_idx]
+                if pl is None:
+                    continue
+                # pelvis_x = 좌우 hip 양측 평균 (lock 8-C-7, §5-2/§5-4 일관)
+                pelvis_x = (pl.hip.left.x + pl.hip.right.x) / 2.0
+                pelvis_x_list.append(pelvis_x)
+
+            if len(pelvis_x_list) < 2:
+                # stride 내 유효 frame < 2 → 변동 계산 불가, skip
+                continue
+
+            x_min = min(pelvis_x_list)
+            x_max = max(pelvis_x_list)
+            x_mean = sum(pelvis_x_list) / len(pelvis_x_list)
+            if abs(x_mean) < 1e-9:
+                # mean ≈ 0 → ratio 무의미, skip (zero-division 가드)
+                continue
+            variation_ratio = (x_max - x_min) / x_mean
+
+            if variation_ratio > cfg.camera_pelvis_x_stride_variation_max:
+                # lock 8-C-1 α: 단일 stride 위반도 트리거
+                return [
+                    ReasonCodeEntry(
+                        reason_code="camera_unstable",
+                        severity=REASON_CODE_SEVERITY["camera_unstable"],
+                    )
+                ]
+
+        return []
+    except Exception:
+        logger.exception(
+            "evaluate_camera_stability 예외 (swallow, camera_unstable 반환)"
+        )
+        return [
+            ReasonCodeEntry(
+                reason_code="camera_unstable",
+                severity=REASON_CODE_SEVERITY["camera_unstable"],
+            )
+        ]
+
+
+# ============================================================
+# §5-6 지표 변동성 stride-level 평가 (Phase 8-C)
+# ============================================================
+
+
+def evaluate_metric_variability(
+    foot_degs: list[float],
+    knee_degs: list[float],
+    trunk_degs: list[float],
+    cfg: MetricVariabilityConfig,
+) -> list[ReasonCodeEntry]:
+    """stride-level 지표 변동성 평가 (docs/2-3-5 §5-6).
+
+    3 metric stride 간 표본 표준편차 (`ddof=1`) 임계 비교:
+    - Foot angle stddev > `cfg.foot_stddev_max_deg` (5°) → `unstable_foot_angle`
+    - Knee flexion stddev > `cfg.knee_stddev_max_deg` (7°) → `unstable_knee_angle`
+    - Trunk lean stddev > `cfg.trunk_stddev_max_deg` (4°) → `unstable_trunk_angle`
+
+    모두 low_confidence 강도 (docs §8-6 정합).
+
+    ⚠️ ddof=1 채택 사유 (lock 5-9): 표본 표준편차 — Python convention default
+    ddof=0 (모집단) 과 다름. 본 측정 stride 5개는 무한 모집단 표본이므로 표본
+    stddev (n-1 분모) 채택. docs §5-6 명시 X, docs 보강 후보.
+
+    입력 형태 (lock 8-C-8 α — Phase 7-A `compute_angle_stats` 패턴 일관):
+    list[float] (각 stride의 metric deg 값). NaN 자동 제외 (numpy.nanstd 사용).
+
+    Args:
+        foot_degs: 각 stride foot_strike_deg list (분석측 단일값).
+        knee_degs: 각 stride knee_flexion_deg list.
+        trunk_degs: 각 stride trunk_lean_deg list.
+        cfg: MetricVariabilityConfig.
+
+    Returns:
+        list[ReasonCodeEntry]:
+        - 3 metric stddev 모두 임계 이내 → `[]`
+        - 각 위반 metric별로 entry 추가 (최대 3개)
+        - 빈 list / 길이 < 2 list → 해당 metric skip (n=1 stddev 미정의)
+
+    견고성 가드:
+    - 입력 list 길이 < 2 → 해당 metric skip
+    - NaN 자동 제외 (np.nanstd)
+    - 유효 값 < 2 → skip
+    - 평가 예외 → failed-safe (3 metric entry 모두 반환)
+    """
+    try:
+        entries: list[ReasonCodeEntry] = []
+
+        def _stddev_safe(values: list[float]) -> Optional[float]:
+            """ddof=1 stddev, NaN 제외, 유효 < 2 → None."""
+            finite = [v for v in values if not (v != v)]  # NaN 검출 (v != v)
+            # 또는 math.isfinite 사용 — 명시적
+            finite = [v for v in values if np.isfinite(v)]
+            if len(finite) < 2:
+                return None
+            return float(np.std(finite, ddof=1))
+
+        foot_std = _stddev_safe(foot_degs)
+        if foot_std is not None and foot_std > cfg.foot_stddev_max_deg:
+            entries.append(
+                ReasonCodeEntry(
+                    reason_code="unstable_foot_angle",
+                    severity=REASON_CODE_SEVERITY["unstable_foot_angle"],
+                )
+            )
+
+        knee_std = _stddev_safe(knee_degs)
+        if knee_std is not None and knee_std > cfg.knee_stddev_max_deg:
+            entries.append(
+                ReasonCodeEntry(
+                    reason_code="unstable_knee_angle",
+                    severity=REASON_CODE_SEVERITY["unstable_knee_angle"],
+                )
+            )
+
+        trunk_std = _stddev_safe(trunk_degs)
+        if trunk_std is not None and trunk_std > cfg.trunk_stddev_max_deg:
+            entries.append(
+                ReasonCodeEntry(
+                    reason_code="unstable_trunk_angle",
+                    severity=REASON_CODE_SEVERITY["unstable_trunk_angle"],
+                )
+            )
+
+        return entries
+    except Exception:
+        logger.exception(
+            "evaluate_metric_variability 예외 (swallow, 3 metric entry 반환)"
+        )
+        return [
+            ReasonCodeEntry(
+                reason_code="unstable_foot_angle",
+                severity=REASON_CODE_SEVERITY["unstable_foot_angle"],
+            ),
+            ReasonCodeEntry(
+                reason_code="unstable_knee_angle",
+                severity=REASON_CODE_SEVERITY["unstable_knee_angle"],
+            ),
+            ReasonCodeEntry(
+                reason_code="unstable_trunk_angle",
+                severity=REASON_CODE_SEVERITY["unstable_trunk_angle"],
+            ),
+        ]
+
 

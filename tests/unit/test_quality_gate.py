@@ -31,7 +31,12 @@ from __future__ import annotations
 
 import pytest
 
-from choborunner_ai.config import SideViewConfig, VisibilityCheckConfig
+from choborunner_ai.config import (
+    MetricVariabilityConfig,
+    SideViewConfig,
+    StrideExclusionConfig,
+    VisibilityCheckConfig,
+)
 from choborunner_ai.pose_extractor import Landmark, LandmarkPair, PoseLandmarks
 from choborunner_ai.quality_gate import (
     REASON_CODE_SEVERITY,
@@ -39,10 +44,12 @@ from choborunner_ai.quality_gate import (
     FrameSideViewResult,
     ReasonCodeEntry,
     evaluate_body_inclusion_accumulation,
+    evaluate_camera_stability,
     evaluate_foot_cutoff_accumulation,
     evaluate_frame_body_inclusion,
     evaluate_frame_foot_cutoff,
     evaluate_frame_side_view,
+    evaluate_metric_variability,
     evaluate_side_view_accumulation,
 )
 
@@ -343,3 +350,90 @@ def test_side_view_accumulation_both_triggers(side_cfg: SideViewConfig):
     assert severities == {"failed", "low_confidence"}
     # 둘 다 reason_code는 'invalid_view'
     assert all(e.reason_code == "invalid_view" for e in out)
+
+
+# ============================================================
+# H. evaluate_camera_stability (§5-5 Phase 8-C)
+# ============================================================
+
+
+@pytest.fixture
+def cam_cfg() -> StrideExclusionConfig:
+    return StrideExclusionConfig()
+
+
+def _camera_pl(hip_x: float) -> PoseLandmarks:
+    """hip 양측 평균 x = hip_x인 합성 PoseLandmarks (camera_stability 입력)."""
+    return PoseLandmarks(
+        shoulder=LandmarkPair(left=_lm(hip_x, 0.20), right=_lm(hip_x, 0.20)),
+        hip=LandmarkPair(
+            left=_lm(hip_x - 0.02, 0.50), right=_lm(hip_x + 0.02, 0.50)
+        ),
+        knee=LandmarkPair(left=_lm(hip_x, 0.65), right=_lm(hip_x, 0.65)),
+        ankle=LandmarkPair(left=_lm(hip_x, 0.85), right=_lm(hip_x, 0.85)),
+        heel=LandmarkPair(left=_lm(hip_x - 0.02, 0.88), right=_lm(hip_x + 0.02, 0.88)),
+        foot_index=LandmarkPair(left=_lm(hip_x, 0.88), right=_lm(hip_x, 0.88)),
+    )
+
+
+def test_camera_stability_normal(cam_cfg: StrideExclusionConfig):
+    """2 stride 모두 pelvis_x 변동 < 30% → []."""
+    # 20 frames, IC at 0/10/20. variation = 0.04/0.50 = 0.08
+    landmarks = [_camera_pl(0.50 + 0.02 * ((-1) ** i)) for i in range(20)]
+    out = evaluate_camera_stability(landmarks, [0, 10, 20], cam_cfg)
+    assert out == []
+
+
+def test_camera_stability_single_stride_violation(cam_cfg: StrideExclusionConfig):
+    """lock 8-C-1 α: 단일 stride 위반도 → camera_unstable 트리거."""
+    # stride 1 정상 + stride 2 큰 변동
+    landmarks = [_camera_pl(0.50 + 0.02 * ((-1) ** i)) for i in range(10)]
+    landmarks += [_camera_pl(0.30 + 0.04 * i) for i in range(10)]
+    out = evaluate_camera_stability(landmarks, [0, 10, 20], cam_cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "camera_unstable"
+    assert out[0].severity == "low_confidence"
+
+
+def test_camera_stability_ic_indices_too_short(cam_cfg: StrideExclusionConfig):
+    """catch 8-C-14: ic_indices 길이 < 2 → []."""
+    landmarks = [_camera_pl(0.50) for _ in range(10)]
+    out = evaluate_camera_stability(landmarks, [0], cam_cfg)
+    assert out == []
+
+
+# ============================================================
+# I. evaluate_metric_variability (§5-6 Phase 8-C)
+# ============================================================
+
+
+@pytest.fixture
+def var_cfg() -> MetricVariabilityConfig:
+    return MetricVariabilityConfig()
+
+
+def test_metric_variability_normal(var_cfg: MetricVariabilityConfig):
+    """3 metric stddev 모두 임계 이내 → []."""
+    foot = [1.0, 2.0, 1.5, 2.5, 1.8]
+    knee = [17.0, 18.0, 17.5, 18.5, 17.2]
+    trunk = [7.0, 7.5, 7.2, 7.8, 7.1]
+    out = evaluate_metric_variability(foot, knee, trunk, var_cfg)
+    assert out == []
+
+
+def test_metric_variability_all_violate(var_cfg: MetricVariabilityConfig):
+    """3 metric 모두 위반 → 3 entry (모두 low_confidence)."""
+    foot = [0.0, 10.0, 20.0, 30.0, 5.0]  # stddev > 5
+    knee = [10.0, 30.0, 15.0, 35.0, 12.0]  # stddev > 7
+    trunk = [0.0, 8.0, 2.0, 10.0, 1.0]  # stddev > 4
+    out = evaluate_metric_variability(foot, knee, trunk, var_cfg)
+    assert len(out) == 3
+    codes = {e.reason_code for e in out}
+    assert codes == {"unstable_foot_angle", "unstable_knee_angle", "unstable_trunk_angle"}
+    assert all(e.severity == "low_confidence" for e in out)
+
+
+def test_metric_variability_n_one_skip(var_cfg: MetricVariabilityConfig):
+    """입력 n=1 → stddev 미정의, 해당 metric skip → []."""
+    out = evaluate_metric_variability([1.0], [10.0], [5.0], var_cfg)
+    assert out == []
