@@ -46,11 +46,13 @@ from typing import Literal, Optional
 import numpy as np
 
 from choborunner_ai.config import (
+    ICValidationConfig,
     MetricVariabilityConfig,
     SideViewConfig,
     StrideExclusionConfig,
     VisibilityCheckConfig,
 )
+from choborunner_ai.metrics.ic_detector import ICConfidence
 from choborunner_ai.pose_extractor import PoseLandmarks
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,10 @@ ReasonCode = Literal[
     "unstable_foot_angle",
     "unstable_knee_angle",
     "unstable_trunk_angle",
+    # §5-7 IC 검증 (Phase 8-D, stride-level — severity 혼합 첫 등장)
+    "insufficient_stride",
+    "low_ic_confidence",
+    "insufficient_window",
 ]
 """docs/2-3-5 §8-2/§8-3 visibility/geometry/side-view 카테고리 reason code 7종.
 
@@ -118,6 +124,10 @@ REASON_CODE_SEVERITY: dict[ReasonCode, Severity] = {
     "unstable_foot_angle": "low_confidence",
     "unstable_knee_angle": "low_confidence",
     "unstable_trunk_angle": "low_confidence",
+    # §5-7 (Phase 8-D, stride-level) — docs §8-5 표 severity 혼합
+    "insufficient_stride": "failed",
+    "low_ic_confidence": "low_confidence",
+    "insufficient_window": "low_confidence",
 }
 """docs §8-2 visibility/geometry reason code **기본/default** severity 사전.
 
@@ -1188,5 +1198,140 @@ def evaluate_metric_variability(
                 severity=REASON_CODE_SEVERITY["unstable_trunk_angle"],
             ),
         ]
+
+
+# ============================================================
+# §5-7 IC 검증 stride-level 평가 (Phase 8-D — severity 혼합 첫 등장)
+# ============================================================
+
+
+def evaluate_ic_validation(
+    ic_confidences: list[ICConfidence],
+    trunk_window_valid_ratios: list[float],
+    cfg: ICValidationConfig,
+) -> list[ReasonCodeEntry]:
+    """stride-level IC 검증 (docs/2-3-5 §5-7).
+
+    3 reason_code 통합 평가 (Phase 8-C `evaluate_metric_variability` 패턴):
+    1. `insufficient_stride` (failed, docs §8-5): `len(ic_confidences) <
+       cfg.min_total_ic` (default 3). lock 8-D-15 α — 전체 ICResult 카운트 (confidence 무관).
+    2. `low_ic_confidence` (low_confidence, docs §8-5): high/medium 신뢰도 IC 수 <
+       `cfg.min_high_medium_confidence_ic` (default 2).
+    3. `insufficient_window` (low_confidence, docs §8-5 + docs/2-3-4 §10): 단일
+       stride라도 trunk_lean window valid ratio < `cfg.trunk_lean_window_min_valid_ratio`
+       (default 0.5) → 트리거 (lock 8-D-3 α 단일 위반 트리거, Phase 8-C 8-C-1 α 패턴).
+
+    ⚠️ severity 혼합 첫 등장 (catch 7-2):
+    한 함수에서 failed (insufficient_stride) + low_confidence (low_ic_confidence,
+    insufficient_window) 둘 다 산출. Phase 8-B-2 `invalid_view`는 동일 reason_code의
+    2강도였으나, 본 8-D는 **다른 reason_code의 서로 다른 severity**. Phase 8-F status
+    분기 시 failed 1개라도 → status=failed.
+
+    ⚠️ stride time 영역 분리 (lock 8-D-1 α, catch 7-1):
+    docs/2-3-4 §10 표는 stride time > 1.5s → "본 stride 분석 제외 + insufficient_stride
+    신호" 명시. 본 함수는 IC count만 평가 — stride time 검사는 Phase 8-I integration
+    scope (stride exclusion 처리 후 남은 stride 수가 insufficient_stride에 반영).
+    docs §5-7 표는 stride time 누락 — **docs 보강 후보**.
+
+    ⚠️ insufficient_window 민감도 (lock 8-D-3 α):
+    단일 stride window valid ratio < 0.5도 트리거. 파일럿 5~10영상 후 β (비율 임계)
+    전환 검토 후보. Phase 8-C 8-C-1 α 패턴 일관.
+
+    ⚠️ 빈 입력 처리:
+    - `ic_confidences = []` (lock 8-D-8 B): insufficient_stride + low_ic_confidence
+      둘 다 트리거 (정보 보존, Phase 8-F가 failed 우선 결정).
+    - `trunk_window_valid_ratios = []` (lock 8-D-9 A): insufficient_window skip
+      (trunk_lean 산출 자체 안 됐다는 신호 — 다른 reason code가 책임. false positive 회피).
+
+    ⚠️ trunk_window_valid_ratios 입력 (catch 7-4):
+    각 stride의 `TrunkLeanResult.window_valid_count / window_total_count` ratio list.
+    `window_total_count = 0` (영상 경계) 가능성 — 호출자(Phase 8-I)가 안전 산출
+    책임 (ratio 0 또는 1로 fallback). 본 함수는 ratio list 받기만.
+
+    ⚠️ Phase 8-I integration anchor (catch 7-5, 7-11):
+    본 함수 입력은 Pipeline에서 추출:
+    - `ic_confidences`: ICResult list의 `.confidence` 추출
+    - `trunk_window_valid_ratios`: TrunkLeanResult list의 `window_valid_count /
+      window_total_count` 산출
+    Phase 8-I 진입 시 PipelineResult에 ICResult list + TrunkLeanResult list 보존
+    필드 추가 필요 (Phase 8-C `landmarks_series` anchor와 함께 누적 2건).
+
+    Args:
+        ic_confidences: 전체 IC 신뢰도 list (각 stride의 ICResult.confidence).
+            len → insufficient_stride 판정.
+            sum(c in ('high','medium')) → low_ic_confidence 판정.
+        trunk_window_valid_ratios: 각 stride의 trunk_lean window valid ratio list
+            (TrunkLeanResult.window_valid_count / window_total_count).
+            any(< 0.5) → insufficient_window 트리거.
+        cfg: ICValidationConfig.
+            - `min_total_ic` (default 3)
+            - `min_high_medium_confidence_ic` (default 2)
+            - `trunk_lean_window_min_valid_ratio` (default 0.5)
+
+    Returns:
+        list[ReasonCodeEntry]: 트리거된 reason code별 entry (최대 3개).
+        - 모두 통과 → `[]`
+        - 빈 ic_confidences → `[insufficient_stride(failed), low_ic_confidence(low_conf)]`
+
+    견고성 가드: 평가 예외 → failed-safe (3 reason code entry 모두 반환).
+    """
+    try:
+        entries: list[ReasonCodeEntry] = []
+
+        # 1. insufficient_stride (failed) — 전체 ICResult 카운트 (lock 8-D-15 α)
+        if len(ic_confidences) < cfg.min_total_ic:
+            entries.append(
+                ReasonCodeEntry(
+                    reason_code="insufficient_stride",
+                    severity=REASON_CODE_SEVERITY["insufficient_stride"],
+                )
+            )
+
+        # 2. low_ic_confidence (low_confidence) — high/medium 카운트
+        high_medium_count = sum(
+            1 for c in ic_confidences if c in ("high", "medium")
+        )
+        if high_medium_count < cfg.min_high_medium_confidence_ic:
+            entries.append(
+                ReasonCodeEntry(
+                    reason_code="low_ic_confidence",
+                    severity=REASON_CODE_SEVERITY["low_ic_confidence"],
+                )
+            )
+
+        # 3. insufficient_window (low_confidence) — 단일 stride 위반 트리거 (lock 8-D-3 α)
+        # 빈 list → skip (lock 8-D-9 A, false positive 회피)
+        if trunk_window_valid_ratios:
+            if any(
+                r < cfg.trunk_lean_window_min_valid_ratio
+                for r in trunk_window_valid_ratios
+            ):
+                entries.append(
+                    ReasonCodeEntry(
+                        reason_code="insufficient_window",
+                        severity=REASON_CODE_SEVERITY["insufficient_window"],
+                    )
+                )
+
+        return entries
+    except Exception:
+        logger.exception(
+            "evaluate_ic_validation 예외 (swallow, 3 reason code entry 반환)"
+        )
+        return [
+            ReasonCodeEntry(
+                reason_code="insufficient_stride",
+                severity=REASON_CODE_SEVERITY["insufficient_stride"],
+            ),
+            ReasonCodeEntry(
+                reason_code="low_ic_confidence",
+                severity=REASON_CODE_SEVERITY["low_ic_confidence"],
+            ),
+            ReasonCodeEntry(
+                reason_code="insufficient_window",
+                severity=REASON_CODE_SEVERITY["insufficient_window"],
+            ),
+        ]
+
 
 

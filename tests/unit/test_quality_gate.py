@@ -32,6 +32,7 @@ from __future__ import annotations
 import pytest
 
 from choborunner_ai.config import (
+    ICValidationConfig,
     MetricVariabilityConfig,
     SideViewConfig,
     StrideExclusionConfig,
@@ -49,6 +50,7 @@ from choborunner_ai.quality_gate import (
     evaluate_frame_body_inclusion,
     evaluate_frame_foot_cutoff,
     evaluate_frame_side_view,
+    evaluate_ic_validation,
     evaluate_metric_variability,
     evaluate_side_view_accumulation,
 )
@@ -437,3 +439,74 @@ def test_metric_variability_n_one_skip(var_cfg: MetricVariabilityConfig):
     """입력 n=1 → stddev 미정의, 해당 metric skip → []."""
     out = evaluate_metric_variability([1.0], [10.0], [5.0], var_cfg)
     assert out == []
+
+
+# ============================================================
+# J. evaluate_ic_validation (§5-7 Phase 8-D, severity 혼합)
+# ============================================================
+
+
+@pytest.fixture
+def ic_cfg() -> ICValidationConfig:
+    return ICValidationConfig()
+
+
+def test_ic_validation_normal(ic_cfg: ICValidationConfig):
+    """정상: IC 5 high + window 0.8 → []."""
+    out = evaluate_ic_validation(["high"] * 5, [0.8] * 5, ic_cfg)
+    assert out == []
+
+
+def test_ic_validation_insufficient_stride_only(ic_cfg: ICValidationConfig):
+    """IC 2 high (count 2 < 3 trigger, high/medium=2 == min 통과) → insufficient_stride만."""
+    out = evaluate_ic_validation(["high"] * 2, [0.8] * 5, ic_cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "insufficient_stride"
+    assert out[0].severity == "failed"
+
+
+def test_ic_validation_low_ic_confidence_only(ic_cfg: ICValidationConfig):
+    """IC 5 + high=1 (high/medium=1 < 2 trigger) + window 0.8 → low_ic_confidence만."""
+    out = evaluate_ic_validation(["high"] + ["low"] * 4, [0.8] * 5, ic_cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "low_ic_confidence"
+    assert out[0].severity == "low_confidence"
+
+
+def test_ic_validation_insufficient_window_only(ic_cfg: ICValidationConfig):
+    """IC 5 high + window 1개 < 0.5 → insufficient_window만 (lock 8-D-3 α 단일 위반)."""
+    out = evaluate_ic_validation(
+        ["high"] * 5,
+        [0.8, 0.8, 0.3, 0.8, 0.8],
+        ic_cfg,
+    )
+    assert len(out) == 1
+    assert out[0].reason_code == "insufficient_window"
+    assert out[0].severity == "low_confidence"
+
+
+def test_ic_validation_all_three_triggers_severity_mixed(ic_cfg: ICValidationConfig):
+    """3 reason_code 모두 트리거 (severity 혼합 catch 7-2 검증).
+
+    IC 1 low → insufficient_stride (failed) + low_ic_confidence (low_conf)
+    window 0.3 → insufficient_window (low_conf)
+    """
+    out = evaluate_ic_validation(["low"], [0.3], ic_cfg)
+    assert len(out) == 3
+    codes = {e.reason_code for e in out}
+    assert codes == {"insufficient_stride", "low_ic_confidence", "insufficient_window"}
+    severities = {e.severity for e in out}
+    assert severities == {"failed", "low_confidence"}
+
+
+def test_ic_validation_empty_inputs(ic_cfg: ICValidationConfig):
+    """lock 8-D-8 B + 8-D-9 A:
+    ic_confidences=[] → insufficient_stride + low_ic_confidence 둘 다 트리거 (정보 보존)
+    trunk_window_valid_ratios=[] → insufficient_window skip (false positive 회피)
+    """
+    out = evaluate_ic_validation([], [], ic_cfg)
+    assert len(out) == 2
+    codes = {e.reason_code for e in out}
+    assert codes == {"insufficient_stride", "low_ic_confidence"}
+    # insufficient_window는 trigger 안 됨 (8-D-9 A skip)
+    assert "insufficient_window" not in codes
