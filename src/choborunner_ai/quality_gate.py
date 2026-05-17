@@ -43,7 +43,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-from choborunner_ai.config import VisibilityCheckConfig
+from choborunner_ai.config import SideViewConfig, VisibilityCheckConfig
 from choborunner_ai.pose_extractor import PoseLandmarks
 
 logger = logging.getLogger(__name__)
@@ -63,8 +63,10 @@ ReasonCode = Literal[
     # §5-2 body 포함 / §5-3 발 잘림 (Phase 8-A)
     "body_not_fully_visible",
     "foot_out_of_frame",
+    # §5-4 측면 구도 (Phase 8-B-2) — context-dependent 2 severity
+    "invalid_view",
 ]
-"""docs/2-3-5 §8-2 visibility/geometry 카테고리 reason code 6종.
+"""docs/2-3-5 §8-2/§8-3 visibility/geometry/side-view 카테고리 reason code 7종.
 
 §5-1 (Phase 4) — `lower_body_not_visible` / `foot_not_visible` /
 `upper_body_not_visible` / `low_landmark_visibility`.
@@ -72,8 +74,14 @@ ReasonCode = Literal[
 §5-2 / §5-3 (Phase 8-A) — `body_not_fully_visible` (전신 미포함, 머리/발끝
 잘림 의심) / `foot_out_of_frame` (발 화면 하단 잘림 의심).
 
-각 코드 강도(failed vs low_confidence)는 REASON_CODE_SEVERITY 참조.
-사용자 메시지는 docs §8-2 표 (SoT). 응답 메시지 매핑 + 우선순위 1개 선택은
+§5-4 (Phase 8-B-2) — `invalid_view` (측면 구도 미달, context-dependent 2 severity):
+- failed: 1차 조건 (hip x 거리) 통과 frame ratio < 0.6
+- low_confidence: 1차 통과 frame 중 보조 조건 (shoulder x / torso yaw) 모두
+  위반 frame ratio ≥ 0.3 (heuristic, β 1차 통과 분모)
+
+각 코드 강도(failed vs low_confidence)는 REASON_CODE_SEVERITY 참조 (fixed
+severity 코드) 또는 산출 함수가 직접 결정 (context-dependent 코드 — invalid_view).
+사용자 메시지는 docs §8-2/§8-3 표 (SoT). 응답 메시지 매핑 + 우선순위 1개 선택은
 §6 status 분기 + §8-7 우선순위 별도 Phase (Phase 8-F)에서.
 """
 
@@ -90,6 +98,9 @@ REASON_CODE_SEVERITY: dict[ReasonCode, Severity] = {
     # §5-2 / §5-3 (Phase 8-A) — docs §8-2 표 둘 다 failed
     "body_not_fully_visible": "failed",
     "foot_out_of_frame": "failed",
+    # §5-4 (Phase 8-B-2) — context-dependent. default 'failed' (β 채택, 더 심각한
+    # 케이스 default). 산출 함수가 context (frame ratio)로 override 가능.
+    "invalid_view": "failed",
 }
 """docs §8-2 visibility/geometry reason code **기본/default** severity 사전.
 
@@ -719,3 +730,228 @@ def evaluate_foot_cutoff_accumulation(
                 severity=REASON_CODE_SEVERITY["foot_out_of_frame"],
             )
         ]
+
+
+# ============================================================
+# §5-4 측면 구도 결과 dataclass (Phase 8-B-2 lock 8-B-4 α)
+# ============================================================
+
+
+@dataclass
+class FrameSideViewResult:
+    """단일 frame §5-4 측면 구도 평가 결과 (1차 + 보조 a + 보조 b sub-check).
+
+    Phase 8-A FrameGeometryResult 패턴 차용하되 ⚠️ `failed_reasons` 필드 생략 —
+    frame-level이 reason code와 1:1 매핑 X (`invalid_view` 부여 여부는 누적
+    `evaluate_side_view_accumulation`에서 1차/보조 위반 frame ratio 기반으로
+    결정). frame-level 산출은 sub-check 결과만 기록.
+
+    Attributes:
+        passed_checks: sub-check 통과 여부 dict.
+            - 'primary_hip_x': 좌우 hip x 거리 < hip_x_distance_max (default 0.05)
+            - 'secondary_a_shoulder_x': 좌우 shoulder x 거리 <
+              shoulder_x_distance_max (default 0.07)
+            - 'secondary_b_torso_yaw': hip x 거리 / hip-shoulder y 거리 <
+              torso_yaw_proxy_max (default 0.15). 분모 < 1e-6면 자동 위반.
+        check_values: 디버깅용 실제 값 dict (파일럿 임계 보정 시 분포 확인).
+            - 'hip_x_distance', 'shoulder_x_distance',
+              'torso_yaw_ratio', 'hip_shoulder_y_distance'.
+        is_valid: frame-level 정상 = primary AND (secondary_a OR secondary_b).
+            docs §5-4 표 "정상 측면 구도" 직역.
+    """
+
+    passed_checks: dict[str, bool] = field(default_factory=dict)
+    check_values: dict[str, float] = field(default_factory=dict)
+    is_valid: bool = False
+
+
+# ============================================================
+# §5-4 측면 구도 frame-level 검사 (Phase 8-B-2)
+# ============================================================
+
+
+def evaluate_frame_side_view(
+    pl: PoseLandmarks,
+    cfg: SideViewConfig,
+) -> FrameSideViewResult:
+    """단일 frame 측면 구도 평가 (docs/2-3-5 §5-4).
+
+    docs §5-4 3 sub-check:
+    1. 1차 조건 (필수): |hip.L.x - hip.R.x| < `cfg.hip_x_distance_max` (0.05).
+    2. 보조 조건 a: |shoulder.L.x - shoulder.R.x| < `cfg.shoulder_x_distance_max`
+       (0.07).
+    3. 보조 조건 b: torso yaw proxy = hip_x_distance / hip_shoulder_y_distance <
+       `cfg.torso_yaw_proxy_max` (0.15). 분모 < 1e-6이면 자동 위반.
+
+    torso yaw proxy 정의 (lock 8-B-6 α — docs §5-4 명시 부족):
+    - 분자: |hip.L.x - hip.R.x| (= 1차 조건과 동일)
+    - 분모: |mean(hip.L.y, hip.R.y) - mean(shoulder.L.y, shoulder.R.y)|
+      → 분석측 무관 (양측 평균, "전신 비틀림" 의미)
+    ⚠️ docs §5-4 본문 "좌우 hip 거리와 hip-shoulder 수직 거리의 비율" 직역 시
+    분석측 단일 vs 양측 평균 모호. 본 구현 양측 평균 채택 (전신 비틀림 의미).
+    별도 docs 보강 후보.
+
+    frame-level 판정:
+    - is_valid (정상) = primary AND (secondary_a OR secondary_b)
+    - ⚠️ frame-level에서 `invalid_view` reason code 부여 X — 누적 `evaluate_side_view_accumulation`이
+      1차/보조 위반 frame ratio 기반으로 결정 (lock 8-B-4 α + catch 8-B-2-α 패턴).
+
+    Args:
+        pl: PoseLandmarks (6 LandmarkPair, shoulder/hip만 사용 — nose/knee/ankle/
+            heel/foot_index 미사용).
+        cfg: SideViewConfig.
+
+    Returns:
+        FrameSideViewResult — 3 sub-check 결과 + check_values + is_valid.
+
+    견고성 가드: 평가 예외 → logger.exception + failed-safe (is_valid=False +
+    빈 passed_checks/check_values).
+    """
+    try:
+        # ── 1차 조건: 좌우 hip x 거리 ─────────────────────
+        hip_x_distance = abs(pl.hip.left.x - pl.hip.right.x)
+        primary_ok = hip_x_distance < cfg.hip_x_distance_max
+
+        # ── 보조 조건 a: 좌우 shoulder x 거리 ─────────────
+        shoulder_x_distance = abs(pl.shoulder.left.x - pl.shoulder.right.x)
+        secondary_a_ok = shoulder_x_distance < cfg.shoulder_x_distance_max
+
+        # ── 보조 조건 b: torso yaw proxy (분모 epsilon 가드) ─
+        hip_y_mean = (pl.hip.left.y + pl.hip.right.y) / 2.0
+        shoulder_y_mean = (pl.shoulder.left.y + pl.shoulder.right.y) / 2.0
+        hip_shoulder_y_distance = abs(hip_y_mean - shoulder_y_mean)
+
+        # catch 8-B-2-β: 분모 < 1e-6 → torso_yaw_ratio = inf, 자동 위반 처리
+        if hip_shoulder_y_distance < 1e-6:
+            torso_yaw_ratio = float("inf")
+            secondary_b_ok = False
+        else:
+            torso_yaw_ratio = hip_x_distance / hip_shoulder_y_distance
+            secondary_b_ok = torso_yaw_ratio < cfg.torso_yaw_proxy_max
+
+        # ── frame-level 정상 판정 ──────────────────────────
+        is_valid = primary_ok and (secondary_a_ok or secondary_b_ok)
+
+        passed_checks = {
+            "primary_hip_x": primary_ok,
+            "secondary_a_shoulder_x": secondary_a_ok,
+            "secondary_b_torso_yaw": secondary_b_ok,
+        }
+        check_values = {
+            "hip_x_distance": hip_x_distance,
+            "shoulder_x_distance": shoulder_x_distance,
+            "torso_yaw_ratio": torso_yaw_ratio,
+            "hip_shoulder_y_distance": hip_shoulder_y_distance,
+        }
+        return FrameSideViewResult(
+            passed_checks=passed_checks,
+            check_values=check_values,
+            is_valid=is_valid,
+        )
+    except Exception:
+        logger.exception(
+            "evaluate_frame_side_view 예외 (swallow, is_valid=False default)"
+        )
+        return FrameSideViewResult(
+            passed_checks={
+                "primary_hip_x": False,
+                "secondary_a_shoulder_x": False,
+                "secondary_b_torso_yaw": False,
+            },
+            check_values={},
+            is_valid=False,
+        )
+
+
+# ============================================================
+# §5-4 측면 구도 누적 평가 (Phase 8-B-2 — 2 severity 분기)
+# ============================================================
+
+
+def evaluate_side_view_accumulation(
+    results: list[FrameSideViewResult],
+    cfg: SideViewConfig,
+) -> list[ReasonCodeEntry]:
+    """§5-4 측면 구도 누적 평가 — 2 severity 분기 (docs/2-3-5 §5-4 + lock).
+
+    docs §5-4 판정 매트릭스:
+    - 1차 조건 위반 frame 비율 > 40% (= 1차 통과 ratio < 60%) →
+      `invalid_view` failed (docs §5-4 명시).
+    - 1차 통과 frame 중 보조 조건 (a + b) 모두 위반 frame ratio ≥ 0.3 →
+      `invalid_view` low_confidence (⚠️ docs §5-4 명시 X, heuristic
+      `cfg.secondary_violation_frame_ratio_max`).
+
+    β 1차 통과 분모 (lock 8-B-7 β 채택):
+    - 보조 위반 ratio 분모 = 1차 통과 frame 수 (전체 X)
+    - "측면처럼 hip은 좁은데 어깨/torso 비틀림 의심" 케이스 명확히 잡음.
+
+    반환 둘 다 (lock catch γ): failed + low_confidence 동시 트리거 가능 시
+    list에 둘 다 entry 추가 — Phase 8-F (status 분기) + 응답 메시지에 위임.
+    Phase 8-F가 §6-3 우선순위 (failed > low_confidence)로 status 결정 +
+    응답 reason_codes 배열에 둘 다 또는 dedup 결정.
+
+    Args:
+        results: list[FrameSideViewResult] (`evaluate_frame_side_view` 누적).
+        cfg: SideViewConfig.
+            - `primary_condition_frame_ratio_min` (failed 임계, default 0.6)
+            - `secondary_violation_frame_ratio_max` (low_conf 임계, default 0.3
+              heuristic)
+
+    Returns:
+        list[ReasonCodeEntry]:
+        - 전부 정상 또는 빈 입력 → `[]`
+        - 1차 통과 ratio < 0.6 → `[ReasonCodeEntry('invalid_view', 'failed')]` 추가
+        - 1차 통과 + 보조 모두 위반 ratio ≥ 0.3 →
+          `[ReasonCodeEntry('invalid_view', 'low_confidence')]` 추가
+        - 두 조건 동시 충족 → 둘 다 entry (list length 2, 둘 다 `invalid_view`)
+
+    견고성 가드: 빈 list → `[]`, 평가 예외 → failed-safe (default 'failed' entry).
+    """
+    try:
+        if not results:
+            return []
+
+        total = len(results)
+        primary_pass_count = sum(1 for r in results if r.passed_checks.get("primary_hip_x", False))
+        primary_pass_ratio = primary_pass_count / total
+
+        entries: list[ReasonCodeEntry] = []
+
+        # 1차 통과 ratio 미달 → failed 강도
+        if primary_pass_ratio < cfg.primary_condition_frame_ratio_min:
+            entries.append(
+                ReasonCodeEntry(reason_code="invalid_view", severity="failed")
+            )
+
+        # 1차 통과 frame 중 보조 (a or b) 모두 위반 ratio (β 1차 통과 분모)
+        if primary_pass_count > 0:
+            secondary_violation_count = sum(
+                1
+                for r in results
+                if r.passed_checks.get("primary_hip_x", False)
+                and not (
+                    r.passed_checks.get("secondary_a_shoulder_x", False)
+                    or r.passed_checks.get("secondary_b_torso_yaw", False)
+                )
+            )
+            secondary_violation_ratio = secondary_violation_count / primary_pass_count
+            if secondary_violation_ratio >= cfg.secondary_violation_frame_ratio_max:
+                entries.append(
+                    ReasonCodeEntry(
+                        reason_code="invalid_view", severity="low_confidence"
+                    )
+                )
+
+        return entries
+    except Exception:
+        logger.exception(
+            "evaluate_side_view_accumulation 예외 "
+            "(swallow, invalid_view failed default 반환)"
+        )
+        return [
+            ReasonCodeEntry(
+                reason_code="invalid_view",
+                severity=REASON_CODE_SEVERITY["invalid_view"],
+            )
+        ]
+

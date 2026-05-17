@@ -502,6 +502,11 @@ class SideViewConfig(BaseModel):
         ge=0.0, le=1.0,
         description="1차 조건 충족 frame 비율 최소. 60% 미만 시 `invalid_view` failed 강도.",
     )
+    secondary_violation_frame_ratio_max: float = Field(
+        default=0.3,
+        ge=0.0, le=1.0,
+        description="1차 조건 충족 frame 중 보조 조건 (a/b) 모두 위반 frame 비율 임계. 본 임계 이상 시 `invalid_view` low_confidence 강도. ⚠️ docs/2-3-5 §5-4 명시 X, heuristic default 0.3 (Phase 8-B-2 lock). β 채택: 1차 통과 분모 — '측면처럼 hip은 좁은데 어깨/torso 비틀림 의심' 잡음. 파일럿 데이터 보정 필요.",
+    )
 
 
 class AnalysisSideConfig(BaseModel):

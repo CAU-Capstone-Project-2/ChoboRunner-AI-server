@@ -1,4 +1,4 @@
-"""quality_gate.py unit 테스트 — docs/2-3-5 §5-2 + §5-3 (Phase 8-A + 8-B-1).
+"""quality_gate.py unit 테스트 — docs/2-3-5 §5-2 + §5-3 + §5-4 (Phase 8-A/8-B-1/8-B-2).
 
 본 파일은 Phase 8-A 신규 — `tmp/phase_8_a_sanity.py` 8 case 이식 + pytest 형식.
 
@@ -9,33 +9,41 @@ Phase 8-B-1 (δ 시그니처 통일):
   list[ReasonCodeEntry] 검증)
 - 신규 case 1: ReasonCodeEntry severity 정합 확인
 
+Phase 8-B-2 (§5-4 측면 구도 invalid_view 2 severity):
+- evaluate_frame_side_view (frame-level 3 sub-check)
+- evaluate_side_view_accumulation (1차/보조 종합 판정, 2 severity 분기)
+- 신규 F/G 카테고리 6 case (frame 3 + 누적 4 시나리오 중 핵심)
+
 ⚠️ §5-1 (evaluate_frame_visibility / evaluate_visibility_accumulation, Phase 4)는
    본 파일에서 다루지 않음 (Phase 4는 sanity script만 작성 — scripts/sanity/
    phase_4_c_integration.py). 향후 §5-1 pytest 이식은 별도 cleanup 후보.
-   Phase 8-B-1 시그니처 통일은 §5-1 함수 본체에 적용됐지만 본 파일은 §5-2/§5-3만
-   test — §5-1 test 부재 catch 그대로.
 
-9 case (8 → 9, +1 case for ReasonCodeEntry severity):
-- A. evaluate_frame_body_inclusion (3)
-- B. evaluate_frame_foot_cutoff (2)
-- C. evaluate_body_inclusion_accumulation (2 + δ 시그니처 backport)
-- D. evaluate_foot_cutoff_accumulation (1 + δ 시그니처 backport)
-- E. ReasonCodeEntry severity 정합 (1, Phase 8-B-1 신규)
+15 case (9 → 15, +6 case for §5-4 Phase 8-B-2):
+- A. evaluate_frame_body_inclusion (3, Phase 8-A)
+- B. evaluate_frame_foot_cutoff (2, Phase 8-A)
+- C. evaluate_body_inclusion_accumulation (2, 8-A + 8-B-1 δ)
+- D. evaluate_foot_cutoff_accumulation (1, 8-A + 8-B-1 δ)
+- E. ReasonCodeEntry severity 정합 (1, Phase 8-B-1)
+- F. evaluate_frame_side_view (2, Phase 8-B-2 — 정상 + 1차 위반)
+- G. evaluate_side_view_accumulation (4 시나리오, Phase 8-B-2)
 """
 from __future__ import annotations
 
 import pytest
 
-from choborunner_ai.config import VisibilityCheckConfig
+from choborunner_ai.config import SideViewConfig, VisibilityCheckConfig
 from choborunner_ai.pose_extractor import Landmark, LandmarkPair, PoseLandmarks
 from choborunner_ai.quality_gate import (
     REASON_CODE_SEVERITY,
     FrameGeometryResult,
+    FrameSideViewResult,
     ReasonCodeEntry,
     evaluate_body_inclusion_accumulation,
     evaluate_foot_cutoff_accumulation,
     evaluate_frame_body_inclusion,
     evaluate_frame_foot_cutoff,
+    evaluate_frame_side_view,
+    evaluate_side_view_accumulation,
 )
 
 
@@ -208,3 +216,130 @@ def test_reason_code_entry_default_severity_lookup():
     entry = ReasonCodeEntry(reason_code="body_not_fully_visible", severity="failed")
     with pytest.raises(Exception):  # FrozenInstanceError (dataclass frozen)
         entry.reason_code = "foot_out_of_frame"  # type: ignore[misc]
+
+
+# ============================================================
+# F. evaluate_frame_side_view (§5-4 Phase 8-B-2)
+# ============================================================
+
+
+@pytest.fixture
+def side_cfg() -> SideViewConfig:
+    return SideViewConfig()
+
+
+def _side_pl(
+    hip_x_dist: float,
+    shoulder_x_dist: float,
+    hip_y: float = 0.50,
+    shoulder_y: float = 0.20,
+) -> PoseLandmarks:
+    """측면 구도 합성 PoseLandmarks (shoulder/hip만 의미 있음)."""
+    return PoseLandmarks(
+        shoulder=LandmarkPair(
+            left=_lm(0.50 - shoulder_x_dist / 2, shoulder_y),
+            right=_lm(0.50 + shoulder_x_dist / 2, shoulder_y),
+        ),
+        hip=LandmarkPair(
+            left=_lm(0.50 - hip_x_dist / 2, hip_y),
+            right=_lm(0.50 + hip_x_dist / 2, hip_y),
+        ),
+        knee=LandmarkPair(left=_lm(0.50, 0.65), right=_lm(0.50, 0.65)),
+        ankle=LandmarkPair(left=_lm(0.50, 0.85), right=_lm(0.50, 0.85)),
+        heel=LandmarkPair(left=_lm(0.48, 0.88), right=_lm(0.52, 0.88)),
+        foot_index=LandmarkPair(left=_lm(0.52, 0.88), right=_lm(0.52, 0.88)),
+    )
+
+
+def test_side_view_frame_normal(side_cfg: SideViewConfig):
+    """정상 측면: hip 0.03 + shoulder 0.05 + yaw 0.1 → 모두 통과."""
+    pl = _side_pl(hip_x_dist=0.03, shoulder_x_dist=0.05)
+    r = evaluate_frame_side_view(pl, side_cfg)
+    assert r.is_valid
+    assert r.passed_checks["primary_hip_x"]
+    assert r.passed_checks["secondary_a_shoulder_x"]
+    assert r.passed_checks["secondary_b_torso_yaw"]
+
+
+def test_side_view_frame_torso_yaw_zero_division_guard(side_cfg: SideViewConfig):
+    """torso yaw 분모 0 (hip_y == shoulder_y) → epsilon 가드 + b 자동 위반.
+
+    catch 8-B-2-β: hip_shoulder_y_distance < 1e-6 → torso_yaw_ratio = inf → b 실패.
+    a는 정상 통과 시 is_valid = primary AND a → True 유지.
+    """
+    pl = _side_pl(hip_x_dist=0.03, shoulder_x_dist=0.05, hip_y=0.30, shoulder_y=0.30)
+    r = evaluate_frame_side_view(pl, side_cfg)
+    assert r.check_values["torso_yaw_ratio"] == float("inf")
+    assert not r.passed_checks["secondary_b_torso_yaw"]
+    # primary AND (a OR b) = True AND (True OR False) = True
+    assert r.is_valid
+
+
+# ============================================================
+# G. evaluate_side_view_accumulation (§5-4 4 시나리오, Phase 8-B-2)
+# ============================================================
+
+
+def _frame(primary: bool, sec_a: bool, sec_b: bool) -> FrameSideViewResult:
+    """누적 평가 합성 입력 — passed_checks만 박음."""
+    return FrameSideViewResult(
+        passed_checks={
+            "primary_hip_x": primary,
+            "secondary_a_shoulder_x": sec_a,
+            "secondary_b_torso_yaw": sec_b,
+        },
+        check_values={},
+        is_valid=primary and (sec_a or sec_b),
+    )
+
+
+def test_side_view_accumulation_normal(side_cfg: SideViewConfig):
+    """(a) 정상: 1차 80% + 보조 위반 0% → []."""
+    results = [_frame(True, True, True) for _ in range(8)] + [
+        _frame(False, False, False) for _ in range(2)
+    ]
+    out = evaluate_side_view_accumulation(results, side_cfg)
+    assert out == []
+
+
+def test_side_view_accumulation_low_confidence_only(side_cfg: SideViewConfig):
+    """(b) low_conf만: 1차 80% + 보조 위반 50% (1차 통과 분모) → low_confidence."""
+    results = (
+        [_frame(True, True, True) for _ in range(4)]
+        + [_frame(True, False, False) for _ in range(4)]
+        + [_frame(False, False, False) for _ in range(2)]
+    )
+    out = evaluate_side_view_accumulation(results, side_cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "invalid_view"
+    assert out[0].severity == "low_confidence"
+
+
+def test_side_view_accumulation_failed_only(side_cfg: SideViewConfig):
+    """(c) failed만: 1차 40% + 보조 위반 0% → failed."""
+    results = (
+        [_frame(True, True, True) for _ in range(4)]
+        + [_frame(False, False, False) for _ in range(6)]
+    )
+    out = evaluate_side_view_accumulation(results, side_cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "invalid_view"
+    assert out[0].severity == "failed"
+
+
+def test_side_view_accumulation_both_triggers(side_cfg: SideViewConfig):
+    """(d) 둘 다: 1차 40% + 보조 위반 50% (1차 통과 분모) → failed + low_confidence.
+
+    catch 8-B-2-γ: list에 둘 다 entry. Phase 8-F (status 분기) 위임.
+    """
+    results = (
+        [_frame(True, True, True) for _ in range(2)]
+        + [_frame(True, False, False) for _ in range(2)]
+        + [_frame(False, False, False) for _ in range(6)]
+    )
+    out = evaluate_side_view_accumulation(results, side_cfg)
+    assert len(out) == 2
+    severities = {e.severity for e in out}
+    assert severities == {"failed", "low_confidence"}
+    # 둘 다 reason_code는 'invalid_view'
+    assert all(e.reason_code == "invalid_view" for e in out)
