@@ -45,6 +45,7 @@ from choborunner_ai.quality_gate import (
     REASON_CODE_SEVERITY,
     FrameGeometryResult,
     FrameSideViewResult,
+    FrameVisibilityResult,
     ReasonCodeEntry,
     ResponseStatusResult,
     compute_response_status,
@@ -54,10 +55,12 @@ from choborunner_ai.quality_gate import (
     evaluate_frame_body_inclusion,
     evaluate_frame_foot_cutoff,
     evaluate_frame_side_view,
+    evaluate_frame_visibility,
     evaluate_ic_validation,
     evaluate_metric_variability,
     evaluate_side_view_accumulation,
     evaluate_tracking_stability,
+    evaluate_visibility_accumulation,
 )
 
 
@@ -696,3 +699,106 @@ def test_response_status_priority_list_length():
     assert len(invalid_view_entries) == 2
     assert ("invalid_view", "failed") in invalid_view_entries
     assert ("invalid_view", "low_confidence") in invalid_view_entries
+
+
+# ============================================================
+# N. §5-1 visibility (Phase 4 — Phase E E-2 sanity → pytest 이식, lock 5건)
+# ============================================================
+#
+# 이식 정합:
+# - 원본: scripts/sanity/phase_4_c_integration.py (단일 main 시나리오)
+# - 본 이식: 5 case parametrize 활용 (4 ReasonCode trigger + 누적 + severity lookup)
+# - scripts/sanity 변경 X (데모 자산 보존, Phase 8-A 보고 §5-1 cleanup 후보 정합 해소)
+
+
+def _make_pose_for_visibility(
+    invalid_landmarks: set[str], invalid_vis: float, normal_vis: float
+) -> PoseLandmarks:
+    """6 LandmarkPair 합성 — sanity script make_pose 패턴 이식.
+
+    Args:
+        invalid_landmarks: visibility 낮출 LandmarkPair 이름 집합.
+        invalid_vis: invalid 시 visibility.
+        normal_vis: 그 외 visibility.
+    """
+    def pair(name: str) -> LandmarkPair:
+        v = invalid_vis if name in invalid_landmarks else normal_vis
+        return LandmarkPair(left=_lm(0.5, 0.5, v), right=_lm(0.5, 0.5, v))
+
+    return PoseLandmarks(
+        shoulder=pair("shoulder"),
+        hip=pair("hip"),
+        knee=pair("knee"),
+        ankle=pair("ankle"),
+        heel=pair("heel"),
+        foot_index=pair("foot_index"),
+    )
+
+
+def test_visibility_frame_normal_pass(cfg: VisibilityCheckConfig):
+    """§5-1 정상 — 4 카테고리 모두 통과 (visibility 0.9) → 빈 failed_reasons."""
+    pl = _make_pose_for_visibility(set(), invalid_vis=0.0, normal_vis=0.9)
+    r = evaluate_frame_visibility(pl, "left", cfg)
+    assert r.is_valid
+    assert r.failed_reasons == []
+
+
+@pytest.mark.parametrize(
+    "invalid_landmarks,expected_reason",
+    [
+        # hip+knee+ankle 미달 (lower_body)
+        ({"hip", "knee", "ankle"}, "lower_body_not_visible"),
+        # heel+foot_index 미달 (foot)
+        ({"heel", "foot_index"}, "foot_not_visible"),
+        # shoulder 미달 (upper_body)
+        ({"shoulder"}, "upper_body_not_visible"),
+        # 전체 미달 (overall_avg < 0.5) — 4 카테고리 모두 실패하지만 overall_avg가
+        # 그중 가장 큰 시그널, low_landmark_visibility 포함 검증
+        ({"shoulder", "hip", "knee", "ankle", "heel", "foot_index"},
+         "low_landmark_visibility"),
+    ],
+)
+def test_visibility_frame_per_reason_code(
+    cfg: VisibilityCheckConfig,
+    invalid_landmarks: set,
+    expected_reason: str,
+):
+    """§5-1 4 ReasonCode trigger parametrize — 각 카테고리 단일 ReasonCode 검증."""
+    pl = _make_pose_for_visibility(invalid_landmarks, invalid_vis=0.1, normal_vis=0.9)
+    r = evaluate_frame_visibility(pl, "left", cfg)
+    assert not r.is_valid
+    assert expected_reason in r.failed_reasons
+
+
+def test_visibility_accumulation_pass(cfg: VisibilityCheckConfig):
+    """§5-1 누적 — 70% 통과 → 빈 list (lock 8-B-1 δ list[ReasonCodeEntry])."""
+    results = (
+        [FrameVisibilityResult(passed_categories={}, category_averages={},
+                                failed_reasons=[], is_valid=True) for _ in range(7)]
+        + [FrameVisibilityResult(passed_categories={}, category_averages={},
+                                 failed_reasons=[], is_valid=False) for _ in range(3)]
+    )
+    out = evaluate_visibility_accumulation(results, cfg)
+    assert out == []
+
+
+def test_visibility_accumulation_fail(cfg: VisibilityCheckConfig):
+    """§5-1 누적 — 50% 통과 → [ReasonCodeEntry('low_landmark_visibility', 'low_confidence')]."""
+    results = (
+        [FrameVisibilityResult(passed_categories={}, category_averages={},
+                                failed_reasons=[], is_valid=True) for _ in range(5)]
+        + [FrameVisibilityResult(passed_categories={}, category_averages={},
+                                 failed_reasons=[], is_valid=False) for _ in range(5)]
+    )
+    out = evaluate_visibility_accumulation(results, cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "low_landmark_visibility"
+    assert out[0].severity == "low_confidence"
+
+
+def test_visibility_severity_lookup_5_1():
+    """§5-1 4 ReasonCode REASON_CODE_SEVERITY 정합 — Phase 4 SoT."""
+    assert REASON_CODE_SEVERITY["lower_body_not_visible"] == "low_confidence"
+    assert REASON_CODE_SEVERITY["foot_not_visible"] == "failed"
+    assert REASON_CODE_SEVERITY["upper_body_not_visible"] == "low_confidence"
+    assert REASON_CODE_SEVERITY["low_landmark_visibility"] == "low_confidence"

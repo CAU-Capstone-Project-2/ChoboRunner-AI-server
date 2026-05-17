@@ -75,8 +75,10 @@ def test_pipeline_e2e_jaemin_video():
     assert ar is not None
     assert isinstance(ar, AnalysisResultMessage)
 
-    # jaemin 실측 status (knee >20° → unstable_knee_angle 또는 above_typical warning)
-    assert ar.status in ("success", "low_confidence")
+    # jaemin 실측 status (Phase 8-I sanity f65cea0 + Phase 8-J anchor 정합, Phase E E-1 강화)
+    # MediaPipe deterministic — 동일 영상 + frame index → 동일 출력
+    # drift catch: model / threshold 변경 시 즉시 회귀
+    assert ar.status == "low_confidence"
     # foot_dominant 산출 정상 (Uncertain 아님)
     assert ar.metrics is not None
     assert ar.metrics.foot_strike_pattern in ("RFS", "MFS", "FFS")
