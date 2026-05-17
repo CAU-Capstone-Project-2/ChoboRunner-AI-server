@@ -50,6 +50,7 @@ from choborunner_ai.config import (
     MetricVariabilityConfig,
     SideViewConfig,
     StrideExclusionConfig,
+    TrackingStabilityConfig,
     VisibilityCheckConfig,
 )
 from choborunner_ai.metrics.ic_detector import ICConfidence
@@ -83,6 +84,13 @@ ReasonCode = Literal[
     "insufficient_stride",
     "low_ic_confidence",
     "insufficient_window",
+    # §4 추적 안정성 (Phase 8-E scope γ — visibility 1 신호 2 reason_code)
+    # ⚠️ Phase 9 분할 anchor: target_switch_detected / unstable_landmark_sequence
+    # 미구현 (lock 8-E-2 β YAGNI). target_switch는 pelvis+scale+visibility 3 신호
+    # AND 동시 트리거, unstable_landmark는 heel/foot mid-stance 잔차 (mid-stance 시점
+    # 정의 catch 7-3). scope γ 채택으로 catch 7-2 (scale 산출 부재) + 7-3 해소.
+    "target_lost",
+    "background_person_interference",
 ]
 """docs/2-3-5 §8-2/§8-3 visibility/geometry/side-view 카테고리 reason code 7종.
 
@@ -128,6 +136,9 @@ REASON_CODE_SEVERITY: dict[ReasonCode, Severity] = {
     "insufficient_stride": "failed",
     "low_ic_confidence": "low_confidence",
     "insufficient_window": "low_confidence",
+    # §4 (Phase 8-E scope γ) — docs §8-4 표 severity 혼합
+    "target_lost": "failed",
+    "background_person_interference": "low_confidence",
 }
 """docs §8-2 visibility/geometry reason code **기본/default** severity 사전.
 
@@ -1334,4 +1345,148 @@ def evaluate_ic_validation(
         ]
 
 
+# ============================================================
+# §4 추적 안정성 sliding window 평가 (Phase 8-E scope γ — visibility 1 신호 2 reason_code)
+# ============================================================
 
+
+def evaluate_tracking_stability(
+    visibility_per_frame: list[float],
+    fps: float,
+    cfg: TrackingStabilityConfig,
+) -> list[ReasonCodeEntry]:
+    """sliding window 추적 안정성 평가 (docs/2-3-5 §4 scope γ).
+
+    docs §4 4 reason_code 중 scope γ (Phase 8-E lock 8-E-1) 2 reason_code 산출:
+    1. `target_lost` (failed, docs §8-4): 1초 sliding window 평균 visibility가
+       5초 이상 연속 < 0.4 (lock 8-E-6 α 정확 해석 — window of windows).
+    2. `background_person_interference` (low_confidence, docs §8-4): visibility
+       borderline (0.4 ≤ v < 0.6) frame 비율 ≥ 30% (lock 8-E-7 α simplification —
+       scope γ는 scale 신호 미산출).
+
+    ⚠️ Phase 9 분할 anchor (lock 8-E-18, 8-E-2 β):
+    docs §4 4 reason_code 중 2개 Phase 9 분리:
+    - `target_switch_detected`: pelvis 잔차 spike + scale spike + visibility 일시
+      붕괴 3 신호 동시 AND. scale 산출 부재 catch 7-2.
+    - `unstable_landmark_sequence`: heel/foot mid-stance 잔차. mid-stance 시점
+      정의 어려움 catch 7-3.
+    scope γ 채택으로 catch 7-2/7-3 해소 — visibility 1 신호로 단순화.
+
+    ⚠️ docs §4-3 simplification (catch 7-7, lock 8-E-17):
+    background_person_interference 직역: visibility borderline AND scale 미세 변동.
+    scope γ는 visibility borderline만 — scale 신호 미사용. 파일럿 5~10영상 후
+    scale 신호 추가 검토 후보. false positive 우려.
+
+    ⚠️ docs §4-2-1 평활화 원칙 (lock 8-E-19):
+    scope γ는 sliding window만 사용 — docs §4-2-1 잔차 평활화 미적용. 파일럿 후
+    적용 검토 후보.
+
+    visibility_per_frame 산출 정의 (lock 8-E-5 δ, 호출자 책임):
+    - 각 frame의 주요 12 LandmarkPair (shoulder/hip/knee/ankle/heel/foot_index 양측)
+      visibility 평균
+    - §5-1 overall_avg 패턴 일관
+    - 호출자(Phase 8-I)가 landmarks_series에서 산출
+
+    ⚠️ sliding window 정확 해석 (lock 8-E-6 α, catch 7-5):
+    - α (본 구현): 1초 window 평균 < 0.4가 5초 연속 (window of windows)
+    - β: visibility frame < 0.4가 5*fps 연속 (단순)
+    α 채택 — docs 직역 더 정확.
+
+    ⚠️ Phase 8-I integration anchor (catch 7-6, anchor 누적 ↓):
+    landmarks_series 보존(Phase 8-C anchor) 시 visibility_per_frame 호출자 산출
+    가능. 추가 필드 X. Phase 8-C/8-D anchor와 통합:
+    - Phase 8-C: landmarks_series (Phase 8-E 신호도 추출)
+    - Phase 8-D: ICResult list + TrunkLeanResult list
+    - Phase 8-E: visibility_per_frame (landmarks_series 파생)
+
+    Args:
+        visibility_per_frame: 각 frame의 주요 12점 visibility 평균 list.
+        fps: 영상 fps. ≤ 1e-6 시 30.0 fallback (lock 8-E-14).
+        cfg: TrackingStabilityConfig.
+            - `visibility_window_seconds` (default 1.0)
+            - `target_lost_seconds` (default 5.0)
+            - `target_lost_visibility_threshold` (default 0.4)
+            - `visibility_borderline_low` (default 0.4)
+            - `visibility_borderline_high` (default 0.6)
+            - `visibility_borderline_violation_ratio_max` (default 0.30)
+
+    Returns:
+        list[ReasonCodeEntry]:
+        - 모두 통과 또는 빈 입력 → `[]` (lock 8-E-13)
+        - target_lost 트리거 → `[ReasonCodeEntry('target_lost', 'failed')]` 추가
+        - background_person_interference 트리거 →
+          `[ReasonCodeEntry('background_person_interference', 'low_confidence')]` 추가
+        - 둘 다 트리거 → 둘 다 entry (severity 혼합)
+        - len(visibility_per_frame) < window_5s_frames → target_lost 산출 X
+          (충분한 frame 없음)
+
+    견고성 가드: 평가 예외 → failed-safe (2 reason code entry 모두 반환).
+    """
+    try:
+        if not visibility_per_frame:
+            return []
+
+        # lock 8-E-14: fps_safe fallback (Phase 7-A 패턴)
+        fps_safe = fps if fps > 1e-6 else 30.0
+
+        entries: list[ReasonCodeEntry] = []
+        n = len(visibility_per_frame)
+
+        # ── 1. target_lost (lock 8-E-6 α: window of windows) ────────
+        # window frame 수 (1초 / 5초)
+        window_1s_frames = max(1, int(fps_safe * cfg.visibility_window_seconds))
+        window_5s_frames = max(1, int(fps_safe * cfg.target_lost_seconds))
+
+        # 1초 window 평균 visibility 시리즈 (manual loop)
+        if n >= window_1s_frames:
+            window_avgs: list[float] = []
+            for i in range(n - window_1s_frames + 1):
+                avg = sum(visibility_per_frame[i:i + window_1s_frames]) / window_1s_frames
+                window_avgs.append(avg)
+
+            # 5초 연속 < threshold 검사 (1초 window 평균 시리즈에서 5*fps 연속)
+            threshold = cfg.target_lost_visibility_threshold
+            consecutive_count = 0
+            for avg in window_avgs:
+                if avg < threshold:
+                    consecutive_count += 1
+                    if consecutive_count >= window_5s_frames:
+                        entries.append(
+                            ReasonCodeEntry(
+                                reason_code="target_lost",
+                                severity=REASON_CODE_SEVERITY["target_lost"],
+                            )
+                        )
+                        break
+                else:
+                    consecutive_count = 0
+
+        # ── 2. background_person_interference (lock 8-E-7 α scope γ) ────
+        # visibility borderline (low ≤ v < high) frame 비율
+        lo = cfg.visibility_borderline_low
+        hi = cfg.visibility_borderline_high
+        borderline_count = sum(1 for v in visibility_per_frame if lo <= v < hi)
+        borderline_ratio = borderline_count / n
+        if borderline_ratio >= cfg.visibility_borderline_violation_ratio_max:
+            entries.append(
+                ReasonCodeEntry(
+                    reason_code="background_person_interference",
+                    severity=REASON_CODE_SEVERITY["background_person_interference"],
+                )
+            )
+
+        return entries
+    except Exception:
+        logger.exception(
+            "evaluate_tracking_stability 예외 (swallow, 2 reason code entry 반환)"
+        )
+        return [
+            ReasonCodeEntry(
+                reason_code="target_lost",
+                severity=REASON_CODE_SEVERITY["target_lost"],
+            ),
+            ReasonCodeEntry(
+                reason_code="background_person_interference",
+                severity=REASON_CODE_SEVERITY["background_person_interference"],
+            ),
+        ]

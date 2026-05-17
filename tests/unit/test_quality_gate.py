@@ -36,6 +36,7 @@ from choborunner_ai.config import (
     MetricVariabilityConfig,
     SideViewConfig,
     StrideExclusionConfig,
+    TrackingStabilityConfig,
     VisibilityCheckConfig,
 )
 from choborunner_ai.pose_extractor import Landmark, LandmarkPair, PoseLandmarks
@@ -53,6 +54,7 @@ from choborunner_ai.quality_gate import (
     evaluate_ic_validation,
     evaluate_metric_variability,
     evaluate_side_view_accumulation,
+    evaluate_tracking_stability,
 )
 
 
@@ -510,3 +512,75 @@ def test_ic_validation_empty_inputs(ic_cfg: ICValidationConfig):
     assert codes == {"insufficient_stride", "low_ic_confidence"}
     # insufficient_window는 trigger 안 됨 (8-D-9 A skip)
     assert "insufficient_window" not in codes
+
+
+# ============================================================
+# K. evaluate_tracking_stability (§4 Phase 8-E scope γ)
+# ============================================================
+
+
+@pytest.fixture
+def track_cfg() -> TrackingStabilityConfig:
+    return TrackingStabilityConfig()
+
+
+def test_tracking_stability_normal(track_cfg: TrackingStabilityConfig):
+    """정상 — 10초 visibility 0.9 전체 → []."""
+    out = evaluate_tracking_stability([0.9] * 300, 30.0, track_cfg)
+    assert out == []
+
+
+def test_tracking_stability_target_lost_only(track_cfg: TrackingStabilityConfig):
+    """target_lost trigger — sliding window of windows 보수성으로 6초 0.2 필요.
+
+    lock 8-E-6 α 정확 해석: 5초 timestamp 동안 매 frame window 평균 < 0.4 필요.
+    raw frame 0.2가 5초만 있어도 sliding window 평균은 늦게 < 0.4 진입.
+    """
+    visibility = [0.9] * 120 + [0.2] * 180  # 4초 0.9 + 6초 0.2
+    out = evaluate_tracking_stability(visibility, 30.0, track_cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "target_lost"
+    assert out[0].severity == "failed"
+
+
+def test_tracking_stability_target_lost_no_trigger_4sec(
+    track_cfg: TrackingStabilityConfig,
+):
+    """4초 0.2 < 5초 → trigger X (sliding window 보수성)."""
+    visibility = [0.9] * 180 + [0.2] * 120  # 6초 0.9 + 4초 0.2
+    out = evaluate_tracking_stability(visibility, 30.0, track_cfg)
+    assert out == []
+
+
+def test_tracking_stability_background_only(track_cfg: TrackingStabilityConfig):
+    """background trigger — borderline 50% ≥ 30%."""
+    visibility = [0.9] * 150 + [0.5] * 150  # 50% borderline (0.4 <= 0.5 < 0.6)
+    out = evaluate_tracking_stability(visibility, 30.0, track_cfg)
+    assert len(out) == 1
+    assert out[0].reason_code == "background_person_interference"
+    assert out[0].severity == "low_confidence"
+
+
+def test_tracking_stability_both_triggers_severity_mixed(
+    track_cfg: TrackingStabilityConfig,
+):
+    """severity 혼합 — target_lost (failed) + background (low_confidence) 둘 다 trigger."""
+    # 0.5 100 frame (borderline ~32%) + 0.9 30 + 0.2 180 (target_lost 6초)
+    visibility = [0.5] * 100 + [0.9] * 30 + [0.2] * 180
+    out = evaluate_tracking_stability(visibility, 30.0, track_cfg)
+    assert len(out) == 2
+    codes = {e.reason_code for e in out}
+    assert codes == {"target_lost", "background_person_interference"}
+    severities = {e.severity for e in out}
+    assert severities == {"failed", "low_confidence"}
+
+
+def test_tracking_stability_empty_and_fps_fallback(
+    track_cfg: TrackingStabilityConfig,
+):
+    """edge case — 빈 list 빈 반환 + fps=0 fps_safe fallback."""
+    # 빈 list (lock 8-E-13)
+    assert evaluate_tracking_stability([], 30.0, track_cfg) == []
+    # fps=0 fallback to 30.0 (lock 8-E-14)
+    out = evaluate_tracking_stability([0.9] * 30, 0.0, track_cfg)
+    assert out == []  # 전체 0.9, trigger X (fallback 작동)
