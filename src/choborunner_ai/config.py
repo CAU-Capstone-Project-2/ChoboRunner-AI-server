@@ -697,6 +697,40 @@ class ICValidationConfig(BaseModel):
 
 
 # ============================================================
+# 2-4-2. AI ↔ Backend WebSocket 연동 (server/ WebSocket 레이어)
+# ============================================================
+
+
+class WebSocketConfig(BaseModel):
+    """AI ↔ Backend WebSocket 연동 transport·운영 설정 (docs/2-4-2).
+
+    ⚠️ 본 클래스는 자세 지표 임계값이 아니라 transport·운영 파라미터다.
+    docs/2-4-2는 백엔드(재민)가 소유하는 파트 간 인터페이스 문서이며, 아래
+    값의 출처는 그 문서 §9 협의 항목 결정이다.
+    """
+
+    endpoint_path: str = Field(
+        default="/ws/inference",
+        description="AI 서버 WebSocket 엔드포인트 경로. docs/2-4-2 §2 / §9 #2 결정.",
+    )
+    no_frame_timeout_sec: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="무수신 타임아웃(초). 마지막 binary frame 수신 후 본 시간 경과 시 세션을 종료로 간주하고 analysis_result를 조립한다. docs/2-4-2 §7-6 (c) / §9 #4 결정(3초).",
+    )
+    max_message_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        gt=0,
+        description="binary frame 크기 한도(byte). docs/2-4-2 §2 연결 정보(10 MB).",
+    )
+    progress_interval_frames: int = Field(
+        default=15,
+        ge=1,
+        description="analysis_progress 송신 간격(frame 수). 본 frame 수마다 1회 snapshot_progress 송신. ⚠️ heuristic — docs/2-4-2 §9 #3 미해결(progress 빈도 추후 확정), ~30fps 기준 0.5초 간격 잠정값.",
+    )
+
+
+# ============================================================
 # AppConfig — 메인 통합 클래스
 # ============================================================
 
@@ -747,6 +781,9 @@ class AppConfig(BaseSettings):
     stride_exclusion: StrideExclusionConfig = Field(default_factory=StrideExclusionConfig)
     variability: MetricVariabilityConfig = Field(default_factory=MetricVariabilityConfig)
     ic_validation: ICValidationConfig = Field(default_factory=ICValidationConfig)
+
+    # ── 2-4-2 AI↔Backend WebSocket 연동 ───────────────────
+    websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
 
     # ── 2-3-6/7 영역 — 해당 docs 확정 후 추가 ────────
 
