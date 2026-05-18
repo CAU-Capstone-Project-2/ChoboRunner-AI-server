@@ -28,10 +28,14 @@ RUN pip install .
 FROM python:3.11-slim AS runtime
 
 # MediaPipe 네이티브 라이브러리 런타임 의존 (docs/docker-container §5)
+#   libgles2 / libegl1: 최신 MediaPipe C 바인딩(mediapipe_c_bindings)이
+#   OpenGL ES 2.0 + EGL에 링크 — 없으면 libGLESv2.so.2 dlopen 실패.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
+        libgles2 \
+        libegl1 \
     && rm -rf /var/lib/apt/lists/*
 
 # 비루트 유저 (docs/docker-container §7-3)
