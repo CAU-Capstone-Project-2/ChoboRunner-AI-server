@@ -20,7 +20,7 @@ Claude Code 및 다른 AI 도구가 이 레포에서 작업할 때 가장 먼저
 - AI: Tae-young Kim (본 레포)
 - Backend (Spring/Java): 재민 — `ChoboRunner-Backend` 레포
 - Frontend (Android): 정우 — `ChoboRunner_Frontend` 레포
-- AI ↔ Backend 연결은 WebSocket (설계문서 2-4-2). Backend가 영상 frame을 보내면 AI가 분석 결과 반환.
+- AI ↔ Backend 연결은 WebSocket (설계문서 `docs/2-4-2.md`, 작성자 백엔드 재민). Backend가 영상 frame을 보내면 AI가 분석 결과 반환.
 
 **legacy 컨텍스트**:
 - 옛 레포 `ChoboRunner-AI`는 그대로 둠 (백엔드 연결용 작업이 push되어 있음)
@@ -64,7 +64,8 @@ ChoboRunner-AI-server/
 │
 ├── docs/                           (Step 6에서 채움)
 │   ├── 0-index.md                  설계문서 통합 인덱스
-│   └── 2-3-{1..7}.md               7개 설계문서
+│   ├── 2-3-{1..7}.md               7개 설계문서 (AI 모듈 SoT)
+│   └── 2-4-2.md                    AI↔Backend WebSocket 연동 (백엔드 재민 작성)
 │
 ├── src/choborunner_ai/             Python 패키지 (실제 라이브러리)
 │   ├── __init__.py
@@ -125,6 +126,8 @@ ChoboRunner-AI-server/
 | 2-3-7 | `result_serializer.py` | 응답 메시지 4종 |
 
 설계문서들은 Step 6에서 docs/에 배치된다.
+
+> **2-4-2 (`docs/2-4-2.md`)** — AI ↔ Backend WebSocket 연동 설계. 위 7종(AI 모듈 SoT)과 달리 **백엔드(재민)가 작성·소유**하는 파트 간 인터페이스 문서. AI 서버는 binary frame wire format(8B ts_ms 헤더)·`stop` 신호 등 이 문서의 규약을 **수신·구현**하는 입장이다. 응답 메시지 본문은 여전히 2-3-7이 단일 정답.
 
 ---
 
@@ -310,3 +313,4 @@ demo2는 0건 → 본 레포는 **모든 PR에 테스트 동반**.
 - 2026-05-10 v3: 개인 규칙은 `CLAUDE.local.md`로 분리. 본 파일은 팀 공유 컨텍스트만.
 - 2026-05-12 v4: §6에 commit 메시지 컨벤션 추가.
 - 2026-05-12 v5: §5-2 Knee Flexion schema를 docs/2-3-4 v2.1 (3분류) 정합으로 업데이트. §6 모듈화 가이드에 config.py 예외 추가.
+- 2026-05-17 v6: §1·§3·§4에 `docs/2-4-2.md` (AI↔Backend WebSocket 연동 설계, 작성자 백엔드 재민) 반영.
