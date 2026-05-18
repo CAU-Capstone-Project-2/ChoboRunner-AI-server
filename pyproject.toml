@@ -25,6 +25,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
     "ruff>=0.3",
+    "httpx>=0.27",  # FastAPI TestClient (WebSocket 통합 테스트)
 ]
 
 [tool.setuptools]
