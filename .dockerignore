@@ -1,0 +1,27 @@
+# ChoboRunner AI 서버 빌드 컨텍스트 제외 — docs/docker-container.md §3-5.
+
+# VCS·가상환경·캐시
+.git
+.venv
+.pytest_cache
+**/__pycache__
+**/*.pyc
+
+# 이미지에 들어가지 않는 디렉터리
+tests
+scripts
+legacy
+docs
+.claude
+tmp
+data
+samples
+
+# 큰 미디어·산출물 — 단 MediaPipe 모델은 빌드에 필요하므로 유지 (§4)
+assets/*
+!assets/models
+
+# 문서·로그 (README.md는 pyproject readme라 유지)
+CLAUDE.md
+CLAUDE.local.md
+*.log

@@ -22,16 +22,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from choborunner_ai.config import AppConfig
+from server.routes import health
 from server.routes.stream import ws_inference
 
 logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
-    """FastAPI app 팩토리 — lifespan + WebSocket 라우트 등록.
+    """FastAPI app 팩토리 — lifespan + healthcheck/WebSocket 라우트 등록.
 
     WebSocket 엔드포인트 경로는 ``cfg.websocket.endpoint_path``
-    (docs/2-4-2 §9 #2 결정 — ``/ws/inference``)로 등록한다.
+    (docs/2-4-2 §9 #2 결정 — ``/ws/inference``)로 등록한다. healthcheck
+    엔드포인트(``GET /healthz``)는 WS 추론과 별개의 운영용 HTTP 라우트로
+    함께 등록한다 (docs/docker-container §6).
 
     Returns:
         구성 완료된 FastAPI app.
@@ -59,6 +62,8 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    # healthcheck — WS 추론과 별개의 운영 엔드포인트 (docs/docker-container §6)
+    app.include_router(health.router)
     app.add_api_websocket_route(cfg.websocket.endpoint_path, ws_inference)
     return app
 
