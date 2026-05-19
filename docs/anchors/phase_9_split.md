@@ -65,3 +65,33 @@
 - Phase 9-A: 5 frame 연속 heuristic 박음 (옆 사람 통과 4 frame은 trigger X,
   옆 사람 정착 10 frame trigger O)
 - docs §4-3 보강 후보 (Phase D 패턴 학습 적용) — 향후 docs 업데이트 시 본 anchor 참조
+
+### B-3: Step 2 결정 3건 lock (Phase 9-A 계산식)
+
+- 결정 1 — pelvis 잔차: α (sliding window 평균 대비 |차이|)
+  · anchor A-3 lock 그대로
+- 결정 2 — scale: γ (hip-shoulder 수직 거리)
+  · Phase 8-B-2 `torso_yaw_proxy` 분모 패턴 재사용 (측면 robust)
+  · `|mean(hip.y) - mean(shoulder.y)|` (정규화 좌표, 키에 비례 안정 척도)
+- 결정 3 — window 산출 정책: α (단순 산술 평균)
+  · Phase 8-E `evaluate_tracking_stability` sliding window 패턴 일관
+  · ⚠️ docs §4-2-1 "중앙값 기반 편차" 직역과 다름 — 향후 Phase 8-E 일관
+    변경 시 같이 보강 후보 (미래의 본인 헷갈리지 않게 박음, Phase D 패턴 학습 적용)
+
+### B-4: visibility 평가 정책 — frame-level 절대값 채택 (Step 2 catch 해소)
+
+- 결정: visibility 조건은 frame-level 절대값 `visibility[t] < 0.4`
+  (window 평균 사용 X)
+- 근거:
+  · pelvis / scale은 **변동성 신호** (window baseline 필요) — sliding window 평균 대비
+  · visibility는 **붕괴 신호** (절대값 frame 단위) — 사람이 바뀌는 순간 자체 drop
+  · 5 frame 연속 정책 (B-2)과 자연 정합 (window 1초 평균은 trigger 사실상 불가:
+    위반 frame이 window 30 frame 중 22+ 필요)
+- catch (Step 2 실측):
+  · 초기 구현 window 1초 평균 채택 시 C 케이스 (10 frame 위반) trigger 실패
+  · window 평균이 < 0.4 되려면 위반 frame이 window의 73% 이상 — 5 frame 연속과 모순
+- ⚠️ docs §4-2 sliding window 1초 패턴과 의미 분화 — pelvis/scale는 변동성,
+  visibility는 붕괴. docs §4-3에 본 의미 분화 보강 후보.
+- ⚠️ TrackingStabilityConfig.visibility_window_seconds 필드는 본 함수 미사용 —
+  Phase 8-E `evaluate_tracking_stability` (target_lost reason_code)에서 활용 중,
+  cfg 필드 제거 X.
