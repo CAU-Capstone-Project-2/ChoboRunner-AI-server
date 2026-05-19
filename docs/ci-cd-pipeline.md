@@ -180,6 +180,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: MediaPipe 런타임 시스템 라이브러리 설치   # Dockerfile runtime과 동일 집합
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libglib2.0-0 libgles2 libegl1
+
       - name: 의존성 설치 (dev extras 포함)
         run: pip install ".[dev]"        # pyproject [project.optional-dependencies] dev
 
@@ -227,6 +233,7 @@ jobs:
 ```
 
 - 잡 3개: `test`(pytest) → `build-push`(빌드·푸시) → `deploy`(EC2 SSH 실행). `needs`로 직렬화한다.
+- `test` 잡은 컨테이너 밖 bare 러너에서 `pytest`를 돌리므로, MediaPipe 네이티브 라이브러리가 `dlopen`하는 OpenGL ES/EGL `.so`(`libgles2`·`libegl1` 등)를 `apt`로 직접 설치한다 — `Dockerfile` runtime 스테이지와 동일한 집합. 이 스텝이 없으면 MediaPipe 추론 통합 테스트가 `libGLESv2.so.2` 부재로 실패한다.
 - `test` 실패 시 `build-push`·`deploy`는 실행되지 않는다 — **검증 안 된 코드는 이미지로도, EC2로도 가지 않는다.** CLAUDE.md §9(모든 PR에 테스트 동반) 정책과 정합.
 - **이벤트별 분기** — `main` 대상 **PR**에서는 `test`와 이미지 **빌드까지만** 실행해 머지 전 결함을 잡는다. `docker login`·`docker push`·`deploy`는 `if: github.event_name != 'pull_request'` 조건으로 **스킵**된다 — 미머지 코드가 `:latest`를 덮어쓰거나 운영 EC2에 배포되지 않게 한다. `main` push(= PR 머지)·수동 실행에서는 세 잡이 모두 끝까지 돈다.
 - `deploy`가 `build-push`에 의존하므로 빌드·푸시 실패 시 EC2는 건드리지 않는다.
@@ -302,3 +309,4 @@ jobs:
 - 2026-05-19 v1 (확정 반영 2): 잔여 미해결 #5·#7을 **결정**으로 전환 — SSH 22 포트 전체 개방(`0.0.0.0/0`, 키페어 인증 전용·비밀번호 로그인 차단 전제), 배포 전 `pytest` 게이트 도입. §5 워크플로우에 `test` 잡 추가(`test`→`build-push`→`deploy` 3잡 직렬화), §2 흐름도·§6-2·§7 표 갱신. 미해결 항목 0건.
 - 2026-05-19 v1 (확정 반영 3): §1 "요구사항 정정 1건" 별도 블록 삭제 — `docker push` 인증 필요성은 §3-2 본문에 사실 정보로 통합하고, §3-2·§5·§8 #8의 "§1 정정" 참조를 정리. §8 중복 #7 행 제거. `.github/workflows/deploy.yml` 구현 완료(§5 설계대로).
 - 2026-05-19 v1 (확정 반영 4): `main` 대상 **PR 검증 트리거** 추가 — `on`에 `pull_request: branches:[main]` 추가. PR에서는 `test`와 이미지 빌드까지만 실행하고 `docker login`·`docker push`·`deploy`는 `if: github.event_name != 'pull_request'`로 스킵(미머지 코드가 `:latest`·운영 EC2에 닿지 않게). §2 흐름도·§5 워크플로우·§7·§8 #2 표 정합 갱신.
+- 2026-05-19 v1 (확정 반영 5): `test` 잡에 MediaPipe 런타임 시스템 라이브러리 설치 스텝 추가 — bare 러너에는 OpenGL ES/EGL `.so`가 없어 MediaPipe 추론 통합 테스트가 `libGLESv2.so.2` 부재로 실패하던 것을 수정. `Dockerfile` runtime 스테이지와 동일한 `apt` 집합(`libgl1`·`libglib2.0-0`·`libgles2`·`libegl1`)을 설치. §5 워크플로우·설명 갱신.

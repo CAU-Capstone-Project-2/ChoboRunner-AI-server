@@ -31,6 +31,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: MediaPipe 런타임 시스템 라이브러리 설치
+        # test 잡은 컨테이너 밖(bare 러너)에서 pytest를 돌린다 — MediaPipe 네이티브
+        # 라이브러리가 dlopen하는 OpenGL ES/EGL .so를 직접 설치해야 한다.
+        # Dockerfile runtime 스테이지와 동일한 apt 집합 (없으면 libGLESv2.so.2 부재로 실패).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libglib2.0-0 libgles2 libegl1
+
       - name: 의존성 설치 (dev extras 포함)
         run: pip install ".[dev]"   # pyproject [project.optional-dependencies] dev
 
