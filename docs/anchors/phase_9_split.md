@@ -46,3 +46,22 @@
 
 - Phase D: schema 자체 미정의 → 보류 (백엔드 미팅 후)
 - Phase 9: 임계 명시 ✓, 계산식만 모호 → 진입 OK (옵션 선택 + 주석)
+
+
+## 추가 결정 (Day 8 진입 후, Phase 9-A Step 1)
+
+### B-1 β: config 단일 SoT — TrackingStabilityConfig 활용 (TargetSwitchConfig 신규 X)
+
+- 결정: 기존 `TrackingStabilityConfig`에 `target_switch_consecutive_frames=5`
+  1 필드만 추가 (Phase 8-E `evaluate_tracking_stability`와 동일 cfg)
+- 근거: 임계 단일 SoT (pelvis_spike 0.15 / scale_spike 0.20 / visibility
+  0.4 / 3 window seconds 모두 기존 활용), drift 위험 0, Phase 8-E 패턴 일관
+- catch: 사용자 트리거 명시 "TargetSwitchConfig 신규 (~30 line)"는 잘못된 추정 —
+  실제 β로 ~10 line
+
+### B-2: 5 frame 연속 정책 docs 보강 후보
+
+- docs §4-3 본문: "동시 발생" + "일시 붕괴"만 명시 — frame 수 정책 X
+- Phase 9-A: 5 frame 연속 heuristic 박음 (옆 사람 통과 4 frame은 trigger X,
+  옆 사람 정착 10 frame trigger O)
+- docs §4-3 보강 후보 (Phase D 패턴 학습 적용) — 향후 docs 업데이트 시 본 anchor 참조
