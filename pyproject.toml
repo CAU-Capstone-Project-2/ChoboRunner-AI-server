@@ -11,7 +11,7 @@ requires-python = ">=3.11,<3.12"
 authors = [{ name = "Tae-young Kim" }]
 dependencies = [
     "mediapipe>=0.10.9",
-    "opencv-python>=4.8.0",
+    "opencv-python-headless>=4.8.0,<4.12",  # headless — 헤드리스 서버 (docs/docker-container §5). <4.12: 4.12+는 numpy>=2 요구 → numpy<2 유지 위해 상한
     "numpy>=1.24.0,<2.0.0",  # mediapipe 호환성, CLAUDE.md §2
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
@@ -25,6 +25,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
     "ruff>=0.3",
+    "httpx>=0.27",  # FastAPI TestClient (WebSocket 통합 테스트)
 ]
 
 [tool.setuptools]

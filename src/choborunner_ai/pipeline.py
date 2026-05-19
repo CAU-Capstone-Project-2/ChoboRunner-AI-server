@@ -224,6 +224,71 @@ class Pipeline:
         )
         return fvr, pl
 
+    def _accumulate_one_frame(
+        self,
+        frame: np.ndarray,
+        timestamp_ms: int,
+        analysis_side: Literal["left", "right"],
+        *,
+        frame_results: list[FrameVisibilityResult],
+        landmarks_series: list[Optional[PoseLandmarks]],
+        body_inclusion_results: list[FrameGeometryResult],
+        foot_cutoff_results: list[FrameGeometryResult],
+        side_view_results: list[FrameSideViewResult],
+    ) -> bool:
+        """단일 frame 추출·평가 → 5개 frame-level 누적 컨테이너에 in-place append.
+
+        ⚠️ Phase WS-A-2 lock — 기존 ``run_on_video_file`` frame loop(§1)의 frame당
+        처리 블록을 본 메서드로 추출(behavior-preserving). 배치 모드와 스트림 모드
+        (``StreamPipeline.push_frame``, docs/2-4-2 §7-3)가 동일 frame 누적 로직을
+        공유하기 위함. ``_accumulate``(§2~§9, Phase WS-A-1 추출)와 짝.
+
+        pose 미검출(또는 frame 처리 예외) 시 ``landmarks_series``에 ``None``을
+        append하고 ``False``를 반환한다. 호출자는 ``False`` 수신 시
+        ``pose_not_detected_count``를 1 증가시킨다.
+
+        Args:
+            frame: BGR np.ndarray.
+            timestamp_ms: MediaPipe stream 모드 timestamp (호출자가 엄격 증가 보장).
+            analysis_side: 'left' 또는 'right'.
+            frame_results: §5-1 visibility 누적 컨테이너 (in-place append).
+            landmarks_series: 전체 frame landmark 시퀀스 (pose 미검출은 None).
+            body_inclusion_results: §5-2 body 포함 누적 컨테이너.
+            foot_cutoff_results: §5-3 발 잘림 누적 컨테이너.
+            side_view_results: §5-4 측면 구도 누적 컨테이너.
+
+        Returns:
+            pose 검출 + visibility 평가 성공 시 True, 그 외(미검출·예외) False.
+        """
+        try:
+            fvr, pl = self._extract_and_evaluate_one_frame(
+                frame, timestamp_ms, analysis_side
+            )
+        except Exception:
+            logger.exception("_accumulate_one_frame: frame 처리 예외 (swallow, skip)")
+            landmarks_series.append(None)
+            return False
+
+        # landmarks_series 누적 (Phase 8-C anchor 해소)
+        landmarks_series.append(pl)
+        if fvr is None:
+            return False
+
+        frame_results.append(fvr)
+
+        # §5-2 body 포함 + §5-3 발 잘림 (lock 8-H-8)
+        body_inclusion_results.append(
+            evaluate_frame_body_inclusion(pl, self._cfg.visibility_check)
+        )
+        foot_cutoff_results.append(
+            evaluate_frame_foot_cutoff(pl, analysis_side, self._cfg.visibility_check)
+        )
+        # §5-4 측면 구도 (lock 8-H-9)
+        side_view_results.append(
+            evaluate_frame_side_view(pl, self._cfg.side_view)
+        )
+        return True
+
     def _compute_visibility_per_frame(
         self, landmarks_series: list[Optional[PoseLandmarks]]
     ) -> list[float]:
@@ -272,107 +337,45 @@ class Pipeline:
                 out.append(r.window_valid_count / r.window_total_count)
         return out
 
-    def run_on_video_file(
+    def _accumulate(
         self,
-        video_path: Path,
+        video_meta: VideoMeta,
         analysis_side: Literal["left", "right"],
-        max_frames: Optional[int] = None,
-        direction: Literal["left_to_right", "right_to_left"] = "left_to_right",
+        direction: Literal["left_to_right", "right_to_left"],
+        frame_results: list[FrameVisibilityResult],
+        landmarks_series: list[Optional[PoseLandmarks]],
+        body_inclusion_results: list[FrameGeometryResult],
+        foot_cutoff_results: list[FrameGeometryResult],
+        side_view_results: list[FrameSideViewResult],
+        pose_not_detected_count: int,
     ) -> PipelineResult:
-        """file path mode end-to-end (Phase 8-H 확장 — Phase 5 metrics + Phase 8-A~8-E 통합).
+        """frame loop 산출물 → 누적 평가 + Phase 5 metrics + 응답 조립.
 
-        ⚠️ Phase 8-H 통합 흐름:
-        1. video_meta + frame loop (Phase 5/8 통합 산출물 누적)
-        2. §5-1/§5-2/§5-3/§5-4 frame-level + 누적
-        3. Phase 5 metrics: compute_ic_indices + trunk_lean/knee_flexion/foot_strike compute_at_ic
-        4. Phase 8-C §5-5 evaluate_camera_stability
-        5. Phase 8-C §5-6 evaluate_metric_variability
-        6. Phase 8-D §5-7 evaluate_ic_validation
-        7. Phase 8-E §4 evaluate_tracking_stability (visibility_per_frame helper)
-        8. reason_code_entries 누적 → PipelineResult 조립
+        ⚠️ Phase WS-A-1 lock — 기존 ``run_on_video_file``의 §2~§9 블록을 본
+        메서드로 추출(behavior-preserving). 배치 모드(``run_on_video_file``)와
+        스트림 모드(``StreamPipeline.finalize``, Phase WS-A-2 예정)가 동일 누적
+        로직을 공유하기 위함. 동작 불변 — 기존 회귀 테스트 그대로 통과해야 함.
 
-        ⚠️ Phase 8-I (응답 조립) scope:
-        compute_response_status + compute_feedback_messages + AnalysisResultMessage 조립.
-        본 8-H는 reason_code_entries 누적까지만.
-
-        ⚠️ direction (lock catch 7-12): 'left_to_right' default. jaemin 영상 기준.
-        Phase 9 자동 결정 anchor (docs §3-1 1.5초 AND 30 frame 정책).
-
-        ⚠️ analysis_side (lock 8-H-6): 호출자 입력 그대로 (현재 CLI default 'left',
-        Phase 9 자동 결정 anchor).
+        호출자는 §1 frame loop로 아래 5개 frame-level 산출물을 누적해 전달한다
+        (배치: ``iter_frames`` 루프 / 스트림: ``push_frame`` 증분 누적).
 
         Args:
-            video_path: 영상 파일 경로.
+            video_meta: 영상 메타데이터. fps_safe 재계산 근거.
             analysis_side: 'left' 또는 'right'.
-            max_frames: 처리할 최대 frame 수 (None이면 full run).
-            direction: 'left_to_right' 또는 'right_to_left' (foot_strike compute_at_ic 입력).
+            direction: 'left_to_right' 또는 'right_to_left'.
+            frame_results: pose 검출 frame의 §5-1 visibility 결과.
+            landmarks_series: 전체 frame landmark 시퀀스 (pose 미검출은 None).
+            body_inclusion_results: §5-2 frame-level body 포함 결과.
+            foot_cutoff_results: §5-3 frame-level 발 잘림 결과.
+            side_view_results: §5-4 frame-level 측면 구도 결과.
+            pose_not_detected_count: pose 미검출 frame 수.
 
         Returns:
-            PipelineResult — 확장 schema 전부 채움.
-
-        Raises:
-            FileNotFoundError: video_path 미존재.
-            ValueError: max_frames <= 0.
-
-        견고성 가드:
-        - max_frames 음수/0 → ValueError
-        - fps ≤ 1e-6 → 30fps fallback
-        - frame 단위 예외 → logger.exception + skip
-        - Phase 5/8 함수 호출 예외 → 각 함수 내부 failed-safe (logger.exception 적용)
+            PipelineResult — analysis_result 포함 전 필드 채움.
         """
-        if max_frames is not None and max_frames <= 0:
-            raise ValueError(
-                f"max_frames must be > 0 or None, got {max_frames}"
-            )
-
-        video_meta = get_video_meta(video_path)
+        # fps_safe: 호출자 중복 계산 회피 — video_meta에서 재도출 (run_on_video_file
+        # §0과 동일 식). 영상 경계/손상 시 30fps fallback.
         fps_safe = video_meta.fps if video_meta.fps > 1e-6 else 30.0
-
-        frame_results: list[FrameVisibilityResult] = []
-        landmarks_series: list[Optional[PoseLandmarks]] = []
-        body_inclusion_results: list[FrameGeometryResult] = []
-        foot_cutoff_results: list[FrameGeometryResult] = []
-        side_view_results: list[FrameSideViewResult] = []
-        pose_not_detected_count = 0
-
-        # ── 1. frame loop (Phase 6 + Phase 8-A/8-B-2 frame-level 통합) ──
-        for idx, frame in enumerate(iter_frames(video_path)):
-            if max_frames is not None and idx >= max_frames:
-                break
-            timestamp_ms = int(idx * 1000.0 / fps_safe)
-            try:
-                fvr, pl = self._extract_and_evaluate_one_frame(
-                    frame, timestamp_ms, analysis_side
-                )
-            except Exception:
-                logger.exception(
-                    "run_on_video_file: frame %d 처리 예외 (swallow, skip)", idx
-                )
-                landmarks_series.append(None)
-                pose_not_detected_count += 1
-                continue
-
-            # landmarks_series 누적 (Phase 8-C anchor 해소)
-            landmarks_series.append(pl)
-
-            if fvr is None:
-                pose_not_detected_count += 1
-                continue
-
-            frame_results.append(fvr)
-
-            # §5-2 body 포함 + §5-3 발 잘림 (lock 8-H-8)
-            body_inclusion_results.append(
-                evaluate_frame_body_inclusion(pl, self._cfg.visibility_check)
-            )
-            foot_cutoff_results.append(
-                evaluate_frame_foot_cutoff(pl, analysis_side, self._cfg.visibility_check)
-            )
-
-            # §5-4 측면 구도 (lock 8-H-9)
-            side_view_results.append(
-                evaluate_frame_side_view(pl, self._cfg.side_view)
-            )
 
         # ── 2. §5-1/§5-2/§5-3/§5-4 누적 평가 → reason_code_entries ──
         reason_code_entries: list[ReasonCodeEntry] = []
@@ -470,3 +473,99 @@ class Pipeline:
         # ── 9. Phase 8-I 응답 조립 (lock 8-I-3 γ — PipelineResult.analysis_result 필드) ──
         result.analysis_result = build_analysis_result(result, analysis_side)
         return result
+
+    def run_on_video_file(
+        self,
+        video_path: Path,
+        analysis_side: Literal["left", "right"],
+        max_frames: Optional[int] = None,
+        direction: Literal["left_to_right", "right_to_left"] = "left_to_right",
+    ) -> PipelineResult:
+        """file path mode end-to-end (Phase 8-H 확장 — Phase 5 metrics + Phase 8-A~8-E 통합).
+
+        ⚠️ Phase 8-H 통합 흐름:
+        1. video_meta + frame loop (Phase 5/8 통합 산출물 누적)
+        2. §5-1/§5-2/§5-3/§5-4 frame-level + 누적
+        3. Phase 5 metrics: compute_ic_indices + trunk_lean/knee_flexion/foot_strike compute_at_ic
+        4. Phase 8-C §5-5 evaluate_camera_stability
+        5. Phase 8-C §5-6 evaluate_metric_variability
+        6. Phase 8-D §5-7 evaluate_ic_validation
+        7. Phase 8-E §4 evaluate_tracking_stability (visibility_per_frame helper)
+        8. reason_code_entries 누적 → PipelineResult 조립
+
+        ⚠️ Phase 8-I (응답 조립) scope:
+        compute_response_status + compute_feedback_messages + AnalysisResultMessage 조립.
+        본 8-H는 reason_code_entries 누적까지만.
+
+        ⚠️ direction (lock catch 7-12): 'left_to_right' default. jaemin 영상 기준.
+        Phase 9 자동 결정 anchor (docs §3-1 1.5초 AND 30 frame 정책).
+
+        ⚠️ analysis_side (lock 8-H-6): 호출자 입력 그대로 (현재 CLI default 'left',
+        Phase 9 자동 결정 anchor).
+
+        Args:
+            video_path: 영상 파일 경로.
+            analysis_side: 'left' 또는 'right'.
+            max_frames: 처리할 최대 frame 수 (None이면 full run).
+            direction: 'left_to_right' 또는 'right_to_left' (foot_strike compute_at_ic 입력).
+
+        Returns:
+            PipelineResult — 확장 schema 전부 채움.
+
+        Raises:
+            FileNotFoundError: video_path 미존재.
+            ValueError: max_frames <= 0.
+
+        견고성 가드:
+        - max_frames 음수/0 → ValueError
+        - fps ≤ 1e-6 → 30fps fallback
+        - frame 단위 예외 → logger.exception + skip
+        - Phase 5/8 함수 호출 예외 → 각 함수 내부 failed-safe (logger.exception 적용)
+        """
+        if max_frames is not None and max_frames <= 0:
+            raise ValueError(
+                f"max_frames must be > 0 or None, got {max_frames}"
+            )
+
+        video_meta = get_video_meta(video_path)
+        fps_safe = video_meta.fps if video_meta.fps > 1e-6 else 30.0
+
+        frame_results: list[FrameVisibilityResult] = []
+        landmarks_series: list[Optional[PoseLandmarks]] = []
+        body_inclusion_results: list[FrameGeometryResult] = []
+        foot_cutoff_results: list[FrameGeometryResult] = []
+        side_view_results: list[FrameSideViewResult] = []
+        pose_not_detected_count = 0
+
+        # ── 1. frame loop (Phase WS-A-2: _accumulate_one_frame 위임) ──
+        # ⚠️ frame당 처리 블록을 _accumulate_one_frame으로 추출 — 배치/스트림 공용.
+        for idx, frame in enumerate(iter_frames(video_path)):
+            if max_frames is not None and idx >= max_frames:
+                break
+            timestamp_ms = int(idx * 1000.0 / fps_safe)
+            pose_detected = self._accumulate_one_frame(
+                frame,
+                timestamp_ms,
+                analysis_side,
+                frame_results=frame_results,
+                landmarks_series=landmarks_series,
+                body_inclusion_results=body_inclusion_results,
+                foot_cutoff_results=foot_cutoff_results,
+                side_view_results=side_view_results,
+            )
+            if not pose_detected:
+                pose_not_detected_count += 1
+
+        # ── 2~9. 누적 평가 + Phase 5 metrics + 응답 조립 (Phase WS-A-1: _accumulate 위임) ──
+        # ⚠️ 기존 §2~§9 인라인 블록을 _accumulate로 추출 — 배치/스트림 공용 로직.
+        return self._accumulate(
+            video_meta=video_meta,
+            analysis_side=analysis_side,
+            direction=direction,
+            frame_results=frame_results,
+            landmarks_series=landmarks_series,
+            body_inclusion_results=body_inclusion_results,
+            foot_cutoff_results=foot_cutoff_results,
+            side_view_results=side_view_results,
+            pose_not_detected_count=pose_not_detected_count,
+        )
