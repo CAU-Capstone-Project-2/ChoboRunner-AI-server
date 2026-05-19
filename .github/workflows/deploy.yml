@@ -1,0 +1,85 @@
+# ChoboRunner AI 서버 CI/CD — docs/ci-cd-pipeline.md §5 설계 구현.
+# test → build-push → deploy 3개 잡을 needs로 직렬화한다.
+# test 실패 시 build-push·deploy는 실행되지 않는다 (검증 안 된 코드는 배포되지 않음).
+#
+# 이벤트별 동작:
+#   - PR(main 대상)   : test + 이미지 빌드 검증만. docker login/push·deploy는 스킵
+#                       (미머지 코드가 :latest를 덮어쓰거나 EC2에 배포되지 않게).
+#   - main push(PR 머지) / 수동 실행 : test → build-push → deploy 전체.
+name: Build & Deploy AI Server
+
+on:
+  push:
+    branches: [main]      # main 푸시(= PR 머지) 시 빌드·푸시·배포
+  pull_request:
+    branches: [main]      # main 대상 PR 시 test·빌드 검증 (배포는 안 함)
+  workflow_dispatch:      # 수동 실행도 허용
+
+env:
+  IMAGE: jaemin1340/capstone2-ai
+
+jobs:
+  # ── 배포 전 테스트 게이트 (docs/ci-cd-pipeline §8 #7) ──
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 소스 checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치 (dev extras 포함)
+        run: pip install ".[dev]"   # pyproject [project.optional-dependencies] dev
+
+      - name: pytest 실행
+        run: pytest                 # testpaths = ["tests"] (pyproject)
+
+  # ── 이미지 빌드·푸시 (docs/ci-cd-pipeline §3) ──
+  #   PR에서는 빌드까지만 — Dockerfile이 깨지지 않는지 검증한다.
+  #   login·push는 main push·수동 실행에서만 (PR이 :latest를 덮어쓰지 않게).
+  build-push:
+    needs: test                     # 테스트 통과 후에만 빌드·푸시
+    runs-on: ubuntu-latest           # amd64 — EC2와 동일 아키텍처
+    steps:
+      - name: 소스 checkout
+        uses: actions/checkout@v4
+
+      - name: Docker Hub 로그인       # push 전 인증 필수 (public 레포라도 push는 인증 필요)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 이미지 빌드 (latest + git SHA)   # PR 포함 항상 실행 — 빌드 검증
+        run: docker build -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
+
+      - name: 이미지 push (모든 태그)
+        if: github.event_name != 'pull_request'
+        run: docker push --all-tags "$IMAGE"
+
+  # ── EC2 배포 (docs/ci-cd-pipeline §4) ──
+  #   PR에서는 잡 전체 스킵 — 미머지 코드는 운영 EC2에 배포하지 않는다.
+  deploy:
+    needs: build-push               # 빌드·푸시 성공 후에만 배포
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: EC2 SSH 배포
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          # pull → 기존 컨테이너 강제 제거 → 신규 실행 → dangling 이미지 정리.
+          # docker rm -f 는 실행 중인 컨테이너도 정지+삭제한다 (docker container prune 으로는 불가).
+          # 첫 배포라 컨테이너가 없으면 || true 로 무시한다.
+          script: |
+            IMAGE=jaemin1340/capstone2-ai
+            docker pull "$IMAGE:latest"
+            docker rm -f choborunner-ai 2>/dev/null || true
+            docker run --rm -d --name choborunner-ai -p 8000:8000 "$IMAGE:latest"
+            docker image prune -f

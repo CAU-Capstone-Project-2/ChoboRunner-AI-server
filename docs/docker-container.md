@@ -20,7 +20,7 @@ Docker Container. ChoboRunner AI 서버 컨테이너 설계
 | 응답 메시지 4종의 필드 스펙은? | **docs/2-3-7** |
 | 자세 지표 계산·IC 검출·품질 게이트는? | **docs/2-3-4 / 2-3-5** |
 | Spring relay·Android 송신 측 배포·인프라는? | **백엔드 레포 `ChoboRunner-Backend`** |
-| CI 파이프라인(빌드 자동화 스크립트) 구체 구현은? | 본 문서는 흐름만 정의 — 구현은 후속 Phase |
+| CI/CD 파이프라인(빌드·푸시·EC2 배포 자동화)은? | **docs/ci-cd-pipeline** |
 
 ### 핵심 결정 5가지
 
@@ -176,21 +176,17 @@ CLAUDE.local.md
 *.log
 ```
 
-> `assets/*`로 전체를 제외하되 `!assets/models/`로 모델 디렉터리만 되살린다 — `.gitignore`가 모델을 제외하는 것과 `.dockerignore`는 별개이며, 모델은 빌드 컨텍스트에 남아야 한다(§4).
+> `assets/*`로 전체를 제외하되 `!assets/models/`로 모델 디렉터리만 되살린다 — `.dockerignore`와 `.gitignore`는 별개의 파일이며, 모델은 빌드 컨텍스트에 남아야 한다(§4).
 
 ---
 
 ## 4. MediaPipe 모델 파일 확보 전략
 
-**문제.** 추론 모델 `assets/models/pose_landmarker_lite.task`는 `.gitignore`의 `models/*.task` 규칙으로 git에 포함되지 않는다. `docker build`는 git이 아니라 **파일시스템 빌드 컨텍스트**에서 `COPY`하므로 모델이 디스크에 있는 개발 머신에서는 동작하지만, **CI의 클린 클론에는 모델이 없어 빌드가 실패**한다.
+추론 모델 `assets/models/pose_landmarker_lite.task`(약 5.5 MB, lite)는 **git에 커밋되어 레포에 포함**된다(커밋 `46de5ed`). `docker build`는 파일시스템 빌드 컨텍스트에서 `COPY`하므로(§3-4), 개발 머신은 물론 **CI의 클린 클론에서도 모델이 존재**한다 — 별도 다운로드 단계 없이 빌드가 자기완결적으로 동작한다.
 
-| 옵션 | 설명 | 평가 |
-| --- | --- | --- |
-| A. 빌드 컨텍스트에서 COPY | 현재 Dockerfile 예시(§3-4) 방식. 모델 파일이 존재하는 머신에서 빌드 시 동작 | v1 단기 — 개발 머신 빌드 한정. CI 빌드엔 불충분 |
-| B. builder 스테이지에서 다운로드 | builder에서 `scripts/fetch_pose_model.py` 실행 → 재현 가능, CI 안전 | **중기 권장.** ⚠️ 단 `fetch_pose_model.py`는 현재 빈 스텁 — 선행 구현 필요 |
-| C. git LFS / 레포 포함 | `.gitignore` 정책을 바꿔 모델을 버전관리 | 정책 변경 비용. v1에서는 보류 |
+> ⚠️ `.gitignore`에 `models/*.task` 규칙이 있으나, 이 패턴은 슬래시가 중간에 있어 **레포 루트에 앵커**되어 `assets/models/...` 경로에는 매칭되지 않는다(`git check-ignore`로 확인 — 미무시). 즉 모델 파일은 의도대로 추적되고 있다. lite 모델은 5.5 MB로 git blob 부담이 없고 사전학습 가중치라 거의 변경되지 않으므로, v1에서는 레포 포함을 유지한다.
 
-**권장.** v1 단기에는 옵션 A를 허용하되(개발 머신 빌드), **CI 빌드를 도입하는 시점에 옵션 B를 선행**한다 — builder 스테이지에서 `pip install .` 직후 `python scripts/fetch_pose_model.py`로 모델을 받아 `assets/models/`에 배치하고, runtime이 그 결과를 복사한다. 모델 경로·이름은 `MediaPipePoseConfig`(`config.py`)가 단일 정답이며, 컨테이너 내 경로는 `CHOBO_MEDIAPIPE_POSE__MODEL_PATH`로 override 가능하다.
+**방식.** 빌드 컨텍스트에서 `COPY`(§3-4 Dockerfile 예시) — runtime 스테이지가 `assets/models/`를 복사한다. 모델 경로·이름은 `MediaPipePoseConfig`(`config.py`)가 단일 정답이며, 컨테이너 내 경로는 `CHOBO_MEDIAPIPE_POSE__MODEL_PATH`로 override 가능하다.
 
 ---
 
@@ -313,7 +309,7 @@ docker run -d \
   --restart unless-stopped \
   --cpus 2 --memory 2g \
   -e CHOBO_WEBSOCKET__NO_FRAME_TIMEOUT_SEC=3.0 \
-  ghcr.io/<org>/choborunner-ai-server:<tag>
+  jaemin1340/capstone2-ai:latest
 ```
 
 배포 환경은 위 한 줄로 끝난다 — 빌드·소스·Python이 필요 없다(요구사항 #2).
@@ -330,7 +326,7 @@ docker run -d \
 
 1. **build** — 빌드 환경에서 `docker build`로 멀티 스테이지 이미지를 만든다.
 2. **tag** — 아래 태깅 전략으로 태그를 단다.
-3. **push** — 컨테이너 레지스트리(GHCR / Docker Hub 등 — 조직·레지스트리 미정, 백엔드 확정)에 push.
+3. **push** — 컨테이너 레지스트리 **Docker Hub `jaemin1340/capstone2-ai`**(public)에 push. 빌드·푸시·배포 자동화 흐름은 docs/ci-cd-pipeline.
 4. **pull & run** — 배포 환경이 이미지를 pull해 `docker run`(§7-5)으로 실행한다. 배포 환경은 **이미지를 빌드하지 않는다**.
 
 ### 이미지 태깅 전략
@@ -340,6 +336,8 @@ docker run -d \
 | `<git-short-sha>` | 불변(immutable) 식별자 — 배포 환경은 이 태그로 핀(pin)해 재현성 확보 |
 | `v0.1.0` 등 semver | 릴리스 버전 — `pyproject.toml` `version`과 정합 |
 | `latest` | 최신 빌드 편의 태그 — **배포 핀 용도로는 사용 금지**(가변) |
+
+> v1 배포 자동화(docs/ci-cd-pipeline §3-3)는 EC2가 편의상 `latest`를 pull하되, 같은 빌드에 `<git-short-sha>` 태그를 함께 push해 "지금 EC2에 뜬 게 어느 커밋인가"의 추적성을 확보한다 — `latest` 단독 핀의 위험을 SHA 태그로 보완하는 절충이다.
 
 ### 빌드 환경과 실행 환경의 분리 (요구사항 #2 핵심)
 
@@ -358,9 +356,9 @@ docker run -d \
 | 3 | 배포 방식 | **결정** — 컨테이너 레지스트리 push/pull, 배포 환경은 run만 (요구사항 #2) |
 | 4 | healthcheck | **결정(설계)** — `GET /healthz` liveness + Docker `HEALTHCHECK` (요구사항 #3). 코드 구현은 후속 Phase |
 | 5 | OpenCV headless 전환 | **완료** — `pyproject.toml` 의존성을 `opencv-python-headless`로 교체 (2026-05-18). 레포에 GUI 호출 없음 (§5) |
-| 6 | MediaPipe 모델 확보 | **잠정** — v1 단기 옵션 A(컨텍스트 COPY), CI 빌드 시 옵션 B(builder fetch) 선행. `fetch_pose_model.py` 구현 필요 (§4) |
+| 6 | MediaPipe 모델 확보 | **결정** — 모델을 git에 커밋(레포 포함), 빌드 컨텍스트에서 `COPY`. CI 클린 클론에서도 자기완결 동작 (§4) |
 | 7 | runtime `apt` 최소 라이브러리 집합 | **검증 필요** — `libgl1`·`libglib2.0-0` 잠정, 첫 빌드 스모크 테스트로 확정 (§5) |
-| 8 | 컨테이너 레지스트리·조직명 | **미정 — 백엔드 확정 대기** (GHCR / Docker Hub 등) |
+| 8 | 컨테이너 레지스트리·조직명 | **결정** — Docker Hub `jaemin1340/capstone2-ai` (public). 배포 자동화는 docs/ci-cd-pipeline |
 | 9 | readiness probe `/readyz` | **v1 범위 밖** — 오케스트레이터 도입 시 추가 (§6-3) |
 | 10 | 리소스 한도(CPU/메모리) 실측값 | **미정** — 첫 이미지로 단일 연결 기준 실측 후 확정 (§7-4) |
 
@@ -371,7 +369,6 @@ docker run -d \
 - `server/routes/health.py` 신규 + `server/main.py` 라우터 등록 (§6).
 - ✅ `pyproject.toml` `opencv-python` → `opencv-python-headless` 교체 완료 (2026-05-18, §5).
 - `Dockerfile` + `.dockerignore` 생성 (§3 예시 기반).
-- (CI 빌드 도입 시) `scripts/fetch_pose_model.py` 구현 (§4 옵션 B).
 
 ---
 
@@ -379,3 +376,5 @@ docker run -d \
 
 - 2026-05-18 v1: 초안. AI 서버 Docker 컨테이너 멀티 스테이지 빌드(builder/runtime 분리)·컨테이너 레지스트리 배포·healthcheck 엔드포인트(`GET /healthz`) 설계. OpenCV headless 전환·MediaPipe 모델 확보 전략을 선행 조정 항목으로 명시. 백엔드(재민) 작성, docs/2-4-2와 동일한 인프라/인터페이스 문서 위치.
 - 2026-05-18 v2: §5 OpenCV headless 전환 적용 완료 — `pyproject.toml` 의존성을 `opencv-python-headless`로 교체. 레포에 GUI 호출이 없어 영향 없음 확인. §9 #5 완료 처리.
+- 2026-05-19 v3: §4 전제 정정 — 모델 파일은 `.gitignore`의 `models/*.task`(루트 앵커 패턴)에 매칭되지 않아 실제로는 git에 커밋·추적 중. "CI 빌드 실패" 전제가 사실과 달라 옵션 B(builder fetch)·C(git LFS) 및 `fetch_pose_model.py` 선행 구현 요구 삭제. §9 #6을 **결정**으로, §3 `.dockerignore` 주석의 `.gitignore` 서술 정정.
+- 2026-05-19 v4: 레지스트리 확정 반영 — docs/ci-cd-pipeline 신설에 따라 §9 #8을 Docker Hub `jaemin1340/capstone2-ai`(public)로 **결정**. §7-5 `docker run` 예시·§8 push 단계의 `ghcr.io/<org>` 자리표시자를 실제 레포명으로 교체. §1 "정의하지 않는 것"의 CI 항목을 docs/ci-cd-pipeline 참조로 갱신. §8 태깅 전략에 v1 배포 흐름(`latest` pull + `<git-short-sha>` 추적) 주석 추가.
