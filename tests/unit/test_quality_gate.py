@@ -688,11 +688,12 @@ def test_response_status_priority_order_sort():
 
 
 def test_response_status_priority_list_length():
-    """REASON_CODE_PRIORITY 길이 = 17 (16 ReasonCode + invalid_view 2 entry).
+    """REASON_CODE_PRIORITY 길이 = 18 (17 ReasonCode + invalid_view 2 entry).
 
-    Phase 9 + 메타데이터 진입 시 PRIORITY 확장 anchor.
+    Phase 8-F SoT base 17 → Phase 9-A `target_switch_detected` 추가 = 18.
+    Phase 9-B + 메타데이터 진입 시 PRIORITY 확장 anchor (Phase 진입마다 1줄 갱신).
     """
-    assert len(REASON_CODE_PRIORITY) == 17
+    assert len(REASON_CODE_PRIORITY) == 18
     # invalid_view 2 entry 확인
     invalid_view_entries = [
         (c, s) for c, s in REASON_CODE_PRIORITY if c == "invalid_view"

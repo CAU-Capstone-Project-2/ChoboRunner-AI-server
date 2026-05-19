@@ -222,6 +222,8 @@ REASON_CODE_USER_MESSAGES: dict[ReasonCode, str] = {
     # §4 추적 안정성 (Phase 8-E scope γ, docs §8-4)
     "target_lost": "분석 대상자가 화면에서 사라졌습니다. 화면에 계속 보이도록 다시 촬영해주세요.",
     "background_person_interference": "주변에 다른 사람이 있어 추정이 불안정합니다. 가능하면 다시 촬영해주세요.",
+    # §4 target_switch_detected (Phase 9-A, docs §8-4)
+    "target_switch_detected": "분석 대상자가 다른 사람과 겹쳐 자세 추정이 불안정합니다. 다시 촬영해주세요.",
 }
 
 

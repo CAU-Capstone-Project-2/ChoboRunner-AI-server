@@ -1504,8 +1504,8 @@ def evaluate_tracking_stability(
 
 REASON_CODE_PRIORITY: list[tuple[ReasonCode, "Severity"]] = [
     # === failed 그룹 (1~5, docs §8-7-2) ===
-    # 그룹 1: 분석 대상자 추적 실패
-    # ⚠️ target_switch_detected (failed) — Phase 9 미구현 (scale 산출 정의 필요)
+    # 그룹 1: 분석 대상자 추적 실패 (docs §8-7-2: target_switch_detected > target_lost)
+    ("target_switch_detected", "failed"),  # Phase 9-A
     ("target_lost", "failed"),
     # 그룹 2: 발 가시성 실패
     ("foot_out_of_frame", "failed"),
