@@ -20,6 +20,7 @@ from choborunner_ai.pipeline import Pipeline
 from choborunner_ai.result_serializer import (
     AnalysisProgressMessage,
     AnalysisResultMessage,
+    FeedbackMessage,
     FrameInferenceMessage,
 )
 from choborunner_ai.stream_pipeline import StreamPipeline
@@ -65,9 +66,101 @@ def test_push_snapshot_finalize_mechanics():
     assert isinstance(prog, AnalysisProgressMessage)
     assert prog.stage == "warming_up"
     assert prog.valid_stride_count == 0
+    # docs/2-3-7 §4 — message는 항상 채움, feedback_messages는 analyzing 단계만
+    assert prog.message == "분석 준비 중입니다."
+    assert prog.feedback_messages is None
 
     assert isinstance(ar, AnalysisResultMessage)
     assert ar.status == "failed"
+
+
+# ============================================================
+# 실시간 피드백 빈도 dedup 단위 테스트 (docs/2-3-6 §3-2)
+# ============================================================
+
+
+def _make_msg(display_text: str, *, category: str = "posture_warning") -> FeedbackMessage:
+    """테스트용 FeedbackMessage factory."""
+    return FeedbackMessage(
+        category=category,  # type: ignore[arg-type]
+        metric="trunk_lean",
+        tts_text=None,
+        display_text=display_text,
+        priority=2,
+        tts_enabled=False,
+        confidence_prefix=False,
+    )
+
+
+@_model_missing
+def test_frequency_dedup_rules():
+    """3 빈도 정책을 단일 인스턴스로 검증 (docs/2-3-6 §3-2). MediaPipe 로드 1회.
+
+    - same-message: 동일 display_text 5초 내 재송신 skip
+    - cool-down: 직전 cycle 후 2초 미만 시 모든 candidates skip
+    - positive (GOOD_PACE): 30초 임계로 same-message 임계 override
+    """
+    from choborunner_ai.feedback_engine import GOOD_PACE_MESSAGE
+
+    with StreamPipeline(AppConfig()) as sp:
+        sp._first_ts_ms = 0
+        msg_trunk = _make_msg("trunk warning")
+        msg_other = _make_msg("other warning")
+        msg_positive = _make_msg(GOOD_PACE_MESSAGE[1], category="posture_info")
+
+        # @0s — 첫 송신 (cool-down·same 모두 통과)
+        sp._last_ts_ms = 0
+        assert len(sp._filter_by_frequency([msg_trunk])) == 1
+
+        # @1s — cool-down 2초 미만 → 어떤 candidate든 skip
+        sp._last_ts_ms = 1000
+        assert sp._filter_by_frequency([msg_other]) == []
+
+        # @3s — cool-down 통과, but same-message는 5초 임계 → trunk skip / other emit
+        sp._last_ts_ms = 3000
+        kept = sp._filter_by_frequency([msg_trunk, msg_other])
+        assert [m.display_text for m in kept] == ["other warning"]
+
+        # @9s — trunk 9초 경과(>5s) → emit
+        sp._last_ts_ms = 9000
+        assert len(sp._filter_by_frequency([msg_trunk])) == 1
+
+        # @15s — positive 첫 송신 (cool-down·same 모두 통과)
+        sp._last_ts_ms = 15_000
+        assert len(sp._filter_by_frequency([msg_positive])) == 1
+
+        # @30s — positive 15초 경과(30초 임계 미만) → skip
+        sp._last_ts_ms = 30_000
+        assert sp._filter_by_frequency([msg_positive]) == []
+
+        # @50s — positive 35초 경과(30초 임계 초과) → emit
+        sp._last_ts_ms = 50_000
+        assert len(sp._filter_by_frequency([msg_positive])) == 1
+
+
+def test_progress_message_set_for_all_stages():
+    """stage가 무엇이든 ``message`` 필드는 채워져야 한다 (docs/2-3-7 §4).
+
+    pure — MediaPipe 불필요 (모듈-level 매핑만 검증).
+    """
+    # blank frame 경로는 warming_up — test_push_snapshot_finalize_mechanics에서 검증됨.
+    from choborunner_ai.stream_pipeline import _PROGRESS_MESSAGE_BY_STAGE
+
+    assert set(_PROGRESS_MESSAGE_BY_STAGE.keys()) == {
+        "warming_up",
+        "collecting_strides",
+        "analyzing",
+    }
+    for text in _PROGRESS_MESSAGE_BY_STAGE.values():
+        assert isinstance(text, str) and text.strip()
+
+
+def test_analyzing_stage_threshold_default_matches_docs():
+    """analyzing 단계 진입 = 유효 stride 3개 (docs/2-3-7 §4-5, docs/2-3-6 §3-1).
+
+    pure — config default 값만 검증. 값이 잘못 바뀌면 본 회귀 테스트가 잡아낸다.
+    """
+    assert AppConfig().feedback_frequency.min_valid_strides_for_analyzing == 3
 
 
 @pytest.mark.skipif(not VIDEO_PATH.exists(), reason="jaemin.mp4 not present")
