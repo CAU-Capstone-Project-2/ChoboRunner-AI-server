@@ -39,13 +39,26 @@ from choborunner_ai.result_serializer import (
     AnalysisProgressMessage,
     AnalysisResultMessage,
     AnalysisStage,
+    FeedbackMessage,
     FrameInferenceMessage,
     FrameInferenceResult,
     FrameQualityFlag,
+    compute_angle_stats,
+    compute_classification_dominant,
+    compute_fsp_dominant,
+    compute_uncertain_stride_count,
 )
 from choborunner_ai.video_preprocessor import VideoMeta
 
 logger = logging.getLogger(__name__)
+
+
+# docs/2-3-7 §4-2/§4-3 예시 — analysis_progress.message stage별 텍스트
+_PROGRESS_MESSAGE_BY_STAGE: dict[AnalysisStage, str] = {
+    "warming_up": "분석 준비 중입니다.",
+    "collecting_strides": "분석 중입니다.",
+    "analyzing": "분석 중입니다.",
+}
 
 
 class StreamPipeline(Pipeline):
@@ -103,6 +116,11 @@ class StreamPipeline(Pipeline):
         self._last_frame_hw: Optional[tuple[int, int]] = None
         self._first_ts_ms: Optional[int] = None
         self._last_ts_ms: Optional[int] = None
+
+        # 실시간 피드백 빈도 dedup 상태 (docs/2-3-6 §3-2)
+        # key = FeedbackMessage.display_text, value = 마지막 송신 시각(_elapsed_sec)
+        self._last_emit_time_by_display: dict[str, float] = {}
+        self._last_any_emit_time: Optional[float] = None
 
     def __enter__(self) -> "StreamPipeline":
         """with-as 컨텍스트 진입 — self 반환 (Pipeline.__exit__가 close 자동 호출)."""
@@ -184,9 +202,15 @@ class StreamPipeline(Pipeline):
         ``valid_stride_count``는 ``result_serializer._build_quality_summary``와
         동일 정의 — ``min(foot_valid, knee_valid, trunk_valid)``.
 
+        실시간 피드백 (docs/2-3-7 §4-3, docs/2-3-6):
+        - ``analyzing`` 단계에서만 ``feedback_messages`` 생성 (docs/2-3-7 §4-5).
+        - mid-stream status는 ``success`` 고정 — reason_code 기반 low_confidence
+          /failed 판단은 누적 평가가 필요하므로 ``finalize``의 최종 응답에서만.
+        - 빈도 제한은 ``_filter_by_frequency``로 dedup (docs/2-3-6 §3-2).
+
         Returns:
-            AnalysisProgressMessage — stage·valid_stride_count·elapsed_sec.
-            message·feedback_messages는 v1에서 None (실시간 피드백은 후속 anchor).
+            AnalysisProgressMessage — stage·valid_stride_count·elapsed_sec +
+            stage별 ``message`` + analyzing 단계 한정 ``feedback_messages``.
         """
         ic_results = compute_ic_indices(
             self._landmarks_series, self._analysis_side, self._cfg.ic
@@ -222,11 +246,120 @@ class StreamPipeline(Pipeline):
         else:
             stage = "collecting_strides"
 
+        feedback_messages: Optional[list[FeedbackMessage]] = None
+        if stage == "analyzing":
+            candidates = self._compute_feedback_candidates(
+                foot_results, knee_results, trunk_results
+            )
+            kept = self._filter_by_frequency(candidates)
+            feedback_messages = kept if kept else None
+
         return AnalysisProgressMessage(
             stage=stage,
             valid_stride_count=valid_stride_count,
             elapsed_sec=self._elapsed_sec(),
+            message=_PROGRESS_MESSAGE_BY_STAGE[stage],
+            feedback_messages=feedback_messages,
         )
+
+    def _compute_feedback_candidates(
+        self,
+        foot_results: list,
+        knee_results: list,
+        trunk_results: list,
+    ) -> list[FeedbackMessage]:
+        """누적 결과 → FeedbackContext → compute_feedback_messages 호출 (docs/2-3-6).
+
+        mid-stream status는 ``success`` 고정 (snapshot_progress docstring 참조).
+        ``build_analysis_result``의 §6 패턴과 동일한 dominant·IQR 산출 사용.
+        """
+        # ⚠️ Lazy import (circular 회피 — build_analysis_result와 동일)
+        from choborunner_ai.feedback_engine import (
+            FeedbackContext,
+            compute_feedback_messages,
+        )
+
+        foot_stats = compute_angle_stats([r.deg for r in foot_results])
+        knee_stats = compute_angle_stats([r.deg for r in knee_results])
+        trunk_stats = compute_angle_stats([r.deg for r in trunk_results])
+
+        foot_dominant_upper, _ratio, _dist = compute_fsp_dominant(
+            [r.classification for r in foot_results]
+        )
+        trunk_dominant = compute_classification_dominant(
+            [r.classification for r in trunk_results]
+        )
+        knee_dominant = compute_classification_dominant(
+            [r.classification for r in knee_results]
+        )
+        uncertain_count = compute_uncertain_stride_count(foot_results)
+
+        ctx = FeedbackContext(
+            status="success",
+            primary_reason_code=None,
+            trunk_classification=trunk_dominant,
+            knee_classification=knee_dominant,
+            foot_dominant=foot_dominant_upper,
+            foot_iqr=(foot_stats.iqr[0], foot_stats.iqr[1])
+            if foot_stats.n_strides > 0
+            else None,
+            knee_iqr=(knee_stats.iqr[0], knee_stats.iqr[1])
+            if knee_stats.n_strides > 0
+            else None,
+            trunk_iqr=(trunk_stats.iqr[0], trunk_stats.iqr[1])
+            if trunk_stats.n_strides > 0
+            else None,
+            uncertain_stride_count=uncertain_count,
+        )
+        return compute_feedback_messages(ctx)
+
+    def _filter_by_frequency(
+        self, candidates: list[FeedbackMessage]
+    ) -> list[FeedbackMessage]:
+        """docs/2-3-6 §3-2 빈도 정책 dedup — display_text 기준.
+
+        - cool-down: 직전 송신 시각으로부터 ``different_message_min_interval_sec``
+          (기본 2초) 미달 시 전체 skip (cycle 자체를 건너뜀).
+        - same-message: 동일 display_text가 ``same_message_min_interval_sec``
+          (기본 5초) 내 재송신되면 skip.
+        - positive (GOOD_PACE): ``positive_message_min_interval_sec`` (기본 30초)
+          기준으로 same-message 임계를 override.
+
+        emit된 경우 ``_last_emit_time_by_display`` + ``_last_any_emit_time``
+        둘 다 갱신한다.
+        """
+        # GOOD_PACE display_text 식별 (lazy import — feedback_engine에서 가져옴)
+        from choborunner_ai.feedback_engine import GOOD_PACE_MESSAGE
+
+        positive_display_text = GOOD_PACE_MESSAGE[1]
+
+        cfg = self._cfg.feedback_frequency
+        now = self._elapsed_sec()
+
+        # cool-down — 직전 cycle 송신 후 different_message_min_interval_sec 미달이면 skip
+        if self._last_any_emit_time is not None:
+            if now - self._last_any_emit_time < cfg.different_message_min_interval_sec:
+                return []
+
+        kept: list[FeedbackMessage] = []
+        for msg in candidates:
+            last_same = self._last_emit_time_by_display.get(msg.display_text)
+            is_positive = msg.display_text == positive_display_text
+            threshold = (
+                cfg.positive_message_min_interval_sec
+                if is_positive
+                else cfg.same_message_min_interval_sec
+            )
+            if last_same is not None and (now - last_same) < threshold:
+                continue
+            kept.append(msg)
+
+        if kept:
+            self._last_any_emit_time = now
+            for msg in kept:
+                self._last_emit_time_by_display[msg.display_text] = now
+
+        return kept
 
     def finalize(self) -> AnalysisResultMessage:
         """누적 종료 → AnalysisResultMessage (docs/2-3-7 §5).

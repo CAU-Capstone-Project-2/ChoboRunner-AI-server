@@ -746,6 +746,41 @@ class WebSocketConfig(BaseModel):
 
 
 # ============================================================
+# 2-3-6. Rule-based 실시간 피드백 — 빈도 정책
+# ============================================================
+
+
+class FeedbackFrequencyConfig(BaseModel):
+    """실시간 피드백 빈도 제한 (docs/2-3-6 §3-2).
+
+    StreamPipeline.snapshot_progress가 analyzing 단계에서 feedback_messages를
+    송신할 때 본 임계값으로 dedup한다. 호출 cadence(progress_interval_frames)와
+    독립 — 실제 송신 간격은 본 임계값을 통과한 메시지에 한해 결정된다.
+
+    docs/2-3-6 §3-2 표 default 값:
+    - 동일 메시지 5초 내 재출력 금지
+    - 서로 다른 메시지 간 2초 최소 간격
+    - 긍정 메시지(GOOD_PACE) 30초 이상 간격
+    """
+
+    same_message_min_interval_sec: float = Field(
+        default=5.0,
+        gt=0.0,
+        description="동일 메시지(display_text 기준) 재출력 최소 간격(초). docs/2-3-6 §3-2.",
+    )
+    different_message_min_interval_sec: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="서로 다른 메시지 간 최소 간격(초). docs/2-3-6 §3-2.",
+    )
+    positive_message_min_interval_sec: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="긍정 메시지(GOOD_PACE) 최소 간격(초). docs/2-3-6 §3-2.",
+    )
+
+
+# ============================================================
 # AppConfig — 메인 통합 클래스
 # ============================================================
 
@@ -800,7 +835,12 @@ class AppConfig(BaseSettings):
     # ── 2-4-2 AI↔Backend WebSocket 연동 ───────────────────
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
 
-    # ── 2-3-6/7 영역 — 해당 docs 확정 후 추가 ────────
+    # ── 2-3-6 실시간 피드백 빈도 정책 ─────────────────────
+    feedback_frequency: FeedbackFrequencyConfig = Field(
+        default_factory=FeedbackFrequencyConfig
+    )
+
+    # ── 2-3-7 영역 — 해당 docs 확정 후 추가 ──────────────
 
 
 app_config = AppConfig()
