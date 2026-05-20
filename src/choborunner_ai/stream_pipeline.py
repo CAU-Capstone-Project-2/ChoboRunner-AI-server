@@ -194,16 +194,19 @@ class StreamPipeline(Pipeline):
         docs/2-4-2 §7-3 — IC 검출·Phase 5 metrics를 현재 ``landmarks_series``로
         재계산한다(비용 있음 — 호출 빈도는 server 레이어 결정, docs/2-4-2 §9 #3).
 
-        stage 판정은 임계값 없는 presence 기반:
+        stage 판정 (docs/2-3-7 §4-5):
         - ``warming_up``: IC 미검출 (분석할 stride 없음)
-        - ``collecting_strides``: IC 검출됐으나 3 metric 공통 valid stride 0
-        - ``analyzing``: 3 metric 모두 valid stride ≥ 1
+        - ``collecting_strides``: IC 검출됐으나 유효 stride
+          ``min_valid_strides_for_analyzing`` (기본 3, docs/2-3-6 §3-1) 미만
+        - ``analyzing``: 유효 stride ≥ ``min_valid_strides_for_analyzing``
 
         ``valid_stride_count``는 ``result_serializer._build_quality_summary``와
         동일 정의 — ``min(foot_valid, knee_valid, trunk_valid)``.
 
         실시간 피드백 (docs/2-3-7 §4-3, docs/2-3-6):
         - ``analyzing`` 단계에서만 ``feedback_messages`` 생성 (docs/2-3-7 §4-5).
+          stage 임계와 동일 게이트라 docs/2-3-6 §3-1 "유효 stride 3개 누적 후
+          첫 피드백 출력"과 자동 정합.
         - mid-stream status는 ``success`` 고정 — reason_code 기반 low_confidence
           /failed 판단은 누적 평가가 필요하므로 ``finalize``의 최종 응답에서만.
         - 빈도 제한은 ``_filter_by_frequency``로 dedup (docs/2-3-6 §3-2).
@@ -239,9 +242,10 @@ class StreamPipeline(Pipeline):
         trunk_valid = sum(1 for r in trunk_results if r.is_valid)
         valid_stride_count = min(foot_valid, knee_valid, trunk_valid)
 
+        min_strides = self._cfg.feedback_frequency.min_valid_strides_for_analyzing
         if not ic_indices:
             stage: AnalysisStage = "warming_up"
-        elif valid_stride_count >= 1:
+        elif valid_stride_count >= min_strides:
             stage = "analyzing"
         else:
             stage = "collecting_strides"

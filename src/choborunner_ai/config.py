@@ -751,11 +751,13 @@ class WebSocketConfig(BaseModel):
 
 
 class FeedbackFrequencyConfig(BaseModel):
-    """실시간 피드백 빈도 제한 (docs/2-3-6 §3-2).
+    """실시간 피드백 출력 정책 (docs/2-3-6 §3-1 / §3-2).
 
-    StreamPipeline.snapshot_progress가 analyzing 단계에서 feedback_messages를
-    송신할 때 본 임계값으로 dedup한다. 호출 cadence(progress_interval_frames)와
-    독립 — 실제 송신 간격은 본 임계값을 통과한 메시지에 한해 결정된다.
+    StreamPipeline.snapshot_progress가 analyzing 단계 전환 및 feedback_messages
+    송신을 결정할 때 본 임계값을 사용한다.
+
+    docs/2-3-6 §3-1 / docs/2-3-7 §4-5 표 default 값:
+    - analyzing 단계 진입은 유효 stride 3개 이상부터 (피드백 출력도 동일 게이트)
 
     docs/2-3-6 §3-2 표 default 값:
     - 동일 메시지 5초 내 재출력 금지
@@ -763,6 +765,14 @@ class FeedbackFrequencyConfig(BaseModel):
     - 긍정 메시지(GOOD_PACE) 30초 이상 간격
     """
 
+    min_valid_strides_for_analyzing: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "analyzing 단계 진입 = 피드백 출력 시작 기준 유효 stride 수. "
+            "docs/2-3-7 §4-5 stage 표 + docs/2-3-6 §3-1 표 (유효 stride 3개 누적 후)."
+        ),
+    )
     same_message_min_interval_sec: float = Field(
         default=5.0,
         gt=0.0,

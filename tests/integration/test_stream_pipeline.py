@@ -138,11 +138,12 @@ def test_frequency_dedup_rules():
         assert len(sp._filter_by_frequency([msg_positive])) == 1
 
 
-@_model_missing
 def test_progress_message_set_for_all_stages():
-    """stage가 무엇이든 ``message`` 필드는 채워져야 한다 (docs/2-3-7 §4)."""
+    """stage가 무엇이든 ``message`` 필드는 채워져야 한다 (docs/2-3-7 §4).
+
+    pure — MediaPipe 불필요 (모듈-level 매핑만 검증).
+    """
     # blank frame 경로는 warming_up — test_push_snapshot_finalize_mechanics에서 검증됨.
-    # 본 테스트는 _PROGRESS_MESSAGE_BY_STAGE 매핑이 3개 stage 모두 커버하는지 검증.
     from choborunner_ai.stream_pipeline import _PROGRESS_MESSAGE_BY_STAGE
 
     assert set(_PROGRESS_MESSAGE_BY_STAGE.keys()) == {
@@ -152,6 +153,14 @@ def test_progress_message_set_for_all_stages():
     }
     for text in _PROGRESS_MESSAGE_BY_STAGE.values():
         assert isinstance(text, str) and text.strip()
+
+
+def test_analyzing_stage_threshold_default_matches_docs():
+    """analyzing 단계 진입 = 유효 stride 3개 (docs/2-3-7 §4-5, docs/2-3-6 §3-1).
+
+    pure — config default 값만 검증. 값이 잘못 바뀌면 본 회귀 테스트가 잡아낸다.
+    """
+    assert AppConfig().feedback_frequency.min_valid_strides_for_analyzing == 3
 
 
 @pytest.mark.skipif(not VIDEO_PATH.exists(), reason="jaemin.mp4 not present")
