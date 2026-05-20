@@ -624,6 +624,21 @@ class TrackingStabilityConfig(BaseModel):
         description="Scale 변동 평가 sliding window (초).",
     )
 
+    # Phase 9-A target_switch_detected (lock β, docs §4-3 보강 anchor)
+    target_switch_consecutive_frames: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "docs/2-3-5 §4-3 target_switch_detected 트리거 — pelvis spike + "
+            "scale spike + visibility 일시 붕괴 3 AND 조건이 본 frame 수 이상 "
+            "연속 발생 시 발화. ⚠️ docs §4-3 본문 '동시 발생' + '일시 붕괴'만 "
+            "명시, 본 frame 수 정책은 false positive 방지 heuristic (옆 사람 "
+            "통과 4 frame은 trigger X, 옆 사람 정착 10 frame trigger O). "
+            "Phase 9-A lock β, docs §4-3 보강 후보 (Phase D 패턴 학습 적용). "
+            "anchor: docs/anchors/phase_9_split.md '추가 결정 (Day 8 진입 후)'."
+        ),
+    )
+
 
 class StrideExclusionConfig(BaseModel):
     """Stride 제외 cross-cutting 조건 (docs/2-3-4 §10 + docs/2-3-5 §5-5).

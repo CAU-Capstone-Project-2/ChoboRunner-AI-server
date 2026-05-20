@@ -56,6 +56,7 @@ from choborunner_ai.quality_gate import (
     evaluate_ic_validation,
     evaluate_metric_variability,
     evaluate_side_view_accumulation,
+    evaluate_target_switch,
     evaluate_tracking_stability,
     evaluate_visibility_accumulation,
 )
@@ -455,6 +456,15 @@ class Pipeline:
                 visibility_per_frame, fps_safe, self._cfg.tracking
             )
         )
+
+        # ── 7-A. Phase 9-A §4-3 target_switch_detected (3 신호 AND + 5 frame 연속) ──
+        # evaluate_target_switch는 Optional[ReasonCodeEntry] 반환 (단일 entry 또는 None)
+        # — 다른 evaluate_*는 list[ReasonCodeEntry] 반환. None 분기 + list wrap.
+        target_switch_entry = evaluate_target_switch(
+            landmarks_series, fps_safe, self._cfg.tracking
+        )
+        if target_switch_entry is not None:
+            reason_code_entries.append(target_switch_entry)
 
         # ── 8. PipelineResult 조립 (확장 schema) ──
         result = PipelineResult(

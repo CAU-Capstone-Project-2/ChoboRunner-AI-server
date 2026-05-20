@@ -92,6 +92,8 @@ ReasonCode = Literal[
     # 정의 catch 7-3). scope γ 채택으로 catch 7-2 (scale 산출 부재) + 7-3 해소.
     "target_lost",
     "background_person_interference",
+    # §4 target_switch_detected (Phase 9-A — pelvis spike + scale spike + visibility 일시 붕괴 3 AND)
+    "target_switch_detected",
 ]
 """docs/2-3-5 §8-2/§8-3 visibility/geometry/side-view 카테고리 reason code 7종.
 
@@ -140,6 +142,8 @@ REASON_CODE_SEVERITY: dict[ReasonCode, Severity] = {
     # §4 (Phase 8-E scope γ) — docs §8-4 표 severity 혼합
     "target_lost": "failed",
     "background_person_interference": "low_confidence",
+    # §4 (Phase 9-A) — docs §8-4 표 failed
+    "target_switch_detected": "failed",
 }
 """docs §8-2 visibility/geometry reason code **기본/default** severity 사전.
 
@@ -1500,8 +1504,8 @@ def evaluate_tracking_stability(
 
 REASON_CODE_PRIORITY: list[tuple[ReasonCode, "Severity"]] = [
     # === failed 그룹 (1~5, docs §8-7-2) ===
-    # 그룹 1: 분석 대상자 추적 실패
-    # ⚠️ target_switch_detected (failed) — Phase 9 미구현 (scale 산출 정의 필요)
+    # 그룹 1: 분석 대상자 추적 실패 (docs §8-7-2: target_switch_detected > target_lost)
+    ("target_switch_detected", "failed"),  # Phase 9-A
     ("target_lost", "failed"),
     # 그룹 2: 발 가시성 실패
     ("foot_out_of_frame", "failed"),
@@ -1691,4 +1695,226 @@ def compute_response_status(
         primary_reason_code=primary_reason_code,
         reason_codes=reason_codes,
     )
+
+
+# ============================================================
+# §4-3 target_switch_detected (Phase 9-A — 3 신호 AND sliding window)
+# ============================================================
+#
+# docs/2-3-5 §4-3 트리거 조건 (모두 동시):
+# - pelvis 잔차 spike > 0.15 (cfg.pelvis_residual_spike)
+# - |scale 변동률| > 0.20 (cfg.scale_spike)
+# - visibility 일시 붕괴 < 0.4 (cfg.target_lost_visibility_threshold)
+#
+# Phase 9-A heuristic (lock B-1/B-2 anchor): 위 3 조건이 본 frame 수 이상 연속
+# 발생 시 발화 (cfg.target_switch_consecutive_frames, default 5). docs §4-3 본문은
+# "일시 붕괴"만 명시 — frame 수 정책 docs 보강 후보.
+#
+# 계산식 lock (anchor B-3):
+# - pelvis 잔차: α sliding window 평균 대비 |차이|
+# - scale: γ hip-shoulder 수직 거리 (Phase 8-B-2 torso_yaw_proxy 분모 재사용, 측면 robust)
+# - window 산출: α 단순 산술 평균 (Phase 8-E `evaluate_tracking_stability` 일관)
+
+
+def _compute_pelvis_residual_series(
+    landmarks_series: list[Optional[PoseLandmarks]],
+    window_frames: int,
+) -> list[float]:
+    """각 frame pelvis_x의 sliding window 평균 대비 |잔차| (anchor B-3 결정 1 α).
+
+    pelvis_x = (hip.L.x + hip.R.x) / 2 — Phase 8-B-2 torso_yaw 분자 패턴 재사용.
+    window: leading (t - window_frames + 1 ~ t).
+    None frame: pelvis_x = 0.0 (별도 검사 X — visibility check가 자연스럽게 잡음).
+
+    Args:
+        landmarks_series: list[PoseLandmarks | None] (Phase 8-C/D/E 패턴).
+        window_frames: sliding window 크기 (frame). cfg.pelvis_window_seconds * fps.
+
+    Returns:
+        list[float] (n=len(landmarks_series)) — 각 frame |residual|.
+    """
+    pelvis_x_list: list[float] = []
+    for pl in landmarks_series:
+        if pl is None:
+            pelvis_x_list.append(0.0)
+        else:
+            pelvis_x_list.append((pl.hip.left.x + pl.hip.right.x) / 2.0)
+
+    n = len(pelvis_x_list)
+    residual: list[float] = [0.0] * n
+    for i in range(n):
+        start = max(0, i - window_frames + 1)
+        window = pelvis_x_list[start:i + 1]
+        if not window:
+            continue
+        window_mean = sum(window) / len(window)
+        residual[i] = abs(pelvis_x_list[i] - window_mean)
+    return residual
+
+
+def _compute_scale_series(
+    landmarks_series: list[Optional[PoseLandmarks]],
+    window_frames: int,
+) -> list[float]:
+    """각 frame hip-shoulder 수직 거리의 sliding window 평균 대비 변동률 (anchor B-3 결정 2 γ).
+
+    scale[t] = |mean(hip.y) - mean(shoulder.y)| — Phase 8-B-2 `torso_yaw_proxy`
+    분모 패턴 재사용 (측면 robust, 키에 비례 안정 척도).
+    변동률: (scale[t] - window_mean) / window_mean (signed).
+    epsilon 가드: window_mean < 1e-6 → 변동률 0.0 (zero-division 회피).
+
+    Args:
+        landmarks_series: list[PoseLandmarks | None].
+        window_frames: sliding window 크기 (frame). cfg.scale_window_seconds * fps.
+
+    Returns:
+        list[float] (n=len) — signed 변동률 (호출자 abs() 검사).
+    """
+    scale_list: list[float] = []
+    for pl in landmarks_series:
+        if pl is None:
+            scale_list.append(0.0)
+        else:
+            hip_y = (pl.hip.left.y + pl.hip.right.y) / 2.0
+            shoulder_y = (pl.shoulder.left.y + pl.shoulder.right.y) / 2.0
+            scale_list.append(abs(hip_y - shoulder_y))
+
+    n = len(scale_list)
+    variation: list[float] = [0.0] * n
+    for i in range(n):
+        start = max(0, i - window_frames + 1)
+        window = scale_list[start:i + 1]
+        if not window:
+            continue
+        window_mean = sum(window) / len(window)
+        if abs(window_mean) < 1e-6:
+            continue  # 변동률 0.0 fallback
+        variation[i] = (scale_list[i] - window_mean) / window_mean
+    return variation
+
+
+def _compute_visibility_per_frame_local(
+    landmarks_series: list[Optional[PoseLandmarks]],
+) -> list[float]:
+    """각 frame 12 LandmarkPair visibility 평균 (frame-level, window X).
+
+    ⚠️ Phase 9-A anchor B-4 lock — visibility는 frame-level 절대값 평가
+    (붕괴 신호). pelvis/scale은 변동성 신호 (window baseline 필요)와 의미 분화.
+
+    ⚠️ Phase 8-H `pipeline._compute_visibility_per_frame`와 동일 시그니처/계산식.
+    향후 두 helper 통합 anchor (현재 quality_gate / pipeline 양쪽 중복).
+
+    None frame: visibility = 0.0 (붕괴 시그널 자연 반영, 5 frame 연속 trigger
+    조건에 자연스럽게 기여).
+
+    Args:
+        landmarks_series: list[PoseLandmarks | None].
+
+    Returns:
+        list[float] (n=len) — 각 frame 12점 평균 visibility (0.0~1.0).
+    """
+    vis_per_frame: list[float] = []
+    for pl in landmarks_series:
+        if pl is None:
+            vis_per_frame.append(0.0)
+            continue
+        vis_sum = (
+            pl.shoulder.left.visibility + pl.shoulder.right.visibility
+            + pl.hip.left.visibility + pl.hip.right.visibility
+            + pl.knee.left.visibility + pl.knee.right.visibility
+            + pl.ankle.left.visibility + pl.ankle.right.visibility
+            + pl.heel.left.visibility + pl.heel.right.visibility
+            + pl.foot_index.left.visibility + pl.foot_index.right.visibility
+        ) / 12.0
+        vis_per_frame.append(vis_sum)
+    return vis_per_frame
+
+
+def evaluate_target_switch(
+    landmarks_series: list[Optional[PoseLandmarks]],
+    fps: float,
+    cfg: TrackingStabilityConfig,
+) -> Optional[ReasonCodeEntry]:
+    """docs/2-3-5 §4-3 target_switch_detected 평가 (Phase 9-A).
+
+    3 신호 AND 조건 + 연속 frame 정책:
+    - pelvis 잔차 (sliding window 평균 대비 |차이|) > `cfg.pelvis_residual_spike` (0.15)
+    - |scale 변동률| (hip-shoulder 수직 거리, window 평균 대비) > `cfg.scale_spike` (0.20)
+    - visibility window 평균 < `cfg.target_lost_visibility_threshold` (0.4)
+    - 위 3 조건이 `cfg.target_switch_consecutive_frames` (5) 이상 연속 발생
+
+    ⚠️ docs §4-3 본문은 "동시 발생" + "일시 붕괴"만 명시. 5 frame 연속 정책은
+    Phase 9-A heuristic (false positive 방지: 옆 사람 통과 4 frame은 trigger X,
+    옆 사람 정착 10 frame trigger O). docs 보강 후보 anchor (Phase D 패턴).
+
+    ⚠️ 계산식 lock (anchor B-3):
+    - pelvis 잔차 α: sliding window 평균 대비 |차이|
+    - scale γ: hip-shoulder 수직 거리 (Phase 8-B-2 torso_yaw_proxy 분모, 측면 robust)
+    - window 산출 α: 단순 산술 평균 (Phase 8-E `evaluate_tracking_stability` 일관)
+
+    Args:
+        landmarks_series: list[PoseLandmarks | None] (Phase 8-C/D/E 패턴).
+        fps: 영상 fps. ≤ 1e-6 시 30.0 fallback (Phase 7-A / 8-E 패턴 일관).
+        cfg: TrackingStabilityConfig (Phase 8-E 동일 cfg, Step 1 lock β).
+            - pelvis_residual_spike (0.15)
+            - scale_spike (0.20)
+            - target_lost_visibility_threshold (0.4)
+            - pelvis_window_seconds (0.5) / scale_window_seconds (1.0) /
+              visibility_window_seconds (1.0)
+            - target_switch_consecutive_frames (5, Phase 9-A 신규)
+
+    Returns:
+        Optional[ReasonCodeEntry]:
+        - 3 AND 조건이 5 frame 이상 연속 → ReasonCodeEntry('target_switch_detected', 'failed')
+        - 빈 입력 또는 trigger 안 됨 → None
+
+    견고성 가드: 평가 예외 → logger.exception + failed-safe (target_switch_detected
+    entry 반환).
+    """
+    try:
+        if not landmarks_series:
+            return None
+
+        fps_safe = fps if fps > 1e-6 else 30.0
+
+        # Phase 9-A anchor B-4: visibility는 frame-level 절대값 평가 (window X).
+        # pelvis/scale은 변동성 신호 (window baseline 필요), visibility는 붕괴 신호.
+        # cfg.visibility_window_seconds 미사용 (Phase 8-E evaluate_tracking_stability
+        # target_lost reason_code에서 활용 중, cfg 필드 제거 X).
+        pelvis_window = max(1, int(fps_safe * cfg.pelvis_window_seconds))
+        scale_window = max(1, int(fps_safe * cfg.scale_window_seconds))
+
+        pelvis_residual = _compute_pelvis_residual_series(
+            landmarks_series, pelvis_window
+        )
+        scale_variation = _compute_scale_series(landmarks_series, scale_window)
+        visibility_per_frame = _compute_visibility_per_frame_local(landmarks_series)
+
+        consecutive = 0
+        for i in range(len(landmarks_series)):
+            pelvis_spike = pelvis_residual[i] > cfg.pelvis_residual_spike
+            scale_spike_violation = abs(scale_variation[i]) > cfg.scale_spike
+            visibility_collapse = (
+                visibility_per_frame[i] < cfg.target_lost_visibility_threshold
+            )
+
+            if pelvis_spike and scale_spike_violation and visibility_collapse:
+                consecutive += 1
+                if consecutive >= cfg.target_switch_consecutive_frames:
+                    return ReasonCodeEntry(
+                        reason_code="target_switch_detected",
+                        severity=REASON_CODE_SEVERITY["target_switch_detected"],
+                    )
+            else:
+                consecutive = 0
+
+        return None
+    except Exception:
+        logger.exception(
+            "evaluate_target_switch 예외 (swallow, target_switch_detected 반환)"
+        )
+        return ReasonCodeEntry(
+            reason_code="target_switch_detected",
+            severity=REASON_CODE_SEVERITY["target_switch_detected"],
+        )
 

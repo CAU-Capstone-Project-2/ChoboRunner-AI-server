@@ -59,6 +59,7 @@ from choborunner_ai.quality_gate import (
     evaluate_ic_validation,
     evaluate_metric_variability,
     evaluate_side_view_accumulation,
+    evaluate_target_switch,
     evaluate_tracking_stability,
     evaluate_visibility_accumulation,
 )
@@ -687,11 +688,12 @@ def test_response_status_priority_order_sort():
 
 
 def test_response_status_priority_list_length():
-    """REASON_CODE_PRIORITY 길이 = 17 (16 ReasonCode + invalid_view 2 entry).
+    """REASON_CODE_PRIORITY 길이 = 18 (17 ReasonCode + invalid_view 2 entry).
 
-    Phase 9 + 메타데이터 진입 시 PRIORITY 확장 anchor.
+    Phase 8-F SoT base 17 → Phase 9-A `target_switch_detected` 추가 = 18.
+    Phase 9-B + 메타데이터 진입 시 PRIORITY 확장 anchor (Phase 진입마다 1줄 갱신).
     """
-    assert len(REASON_CODE_PRIORITY) == 17
+    assert len(REASON_CODE_PRIORITY) == 18
     # invalid_view 2 entry 확인
     invalid_view_entries = [
         (c, s) for c, s in REASON_CODE_PRIORITY if c == "invalid_view"
@@ -802,3 +804,128 @@ def test_visibility_severity_lookup_5_1():
     assert REASON_CODE_SEVERITY["foot_not_visible"] == "failed"
     assert REASON_CODE_SEVERITY["upper_body_not_visible"] == "low_confidence"
     assert REASON_CODE_SEVERITY["low_landmark_visibility"] == "low_confidence"
+
+
+# ============================================================
+# O. §4-3 target_switch_detected (Phase 9-A — 3 신호 AND + 5 frame 연속)
+# ============================================================
+#
+# 시그니처 매트릭스 (anchor B-1~B-4 lock):
+# - pelvis 잔차 > 0.15 (sliding window 평균 대비 |차이|, B-3 결정 1 α)
+# - |scale 변동률| > 0.20 (hip-shoulder 수직 거리, B-3 결정 2 γ)
+# - visibility < 0.4 (frame-level 절대값, B-4 lock)
+# - 5 frame 이상 연속 위반 (B-2 lock, target_switch_consecutive_frames=5)
+
+
+def _pl_for_switch(
+    hip_x: float = 0.5,
+    hip_y: float = 0.5,
+    shoulder_y: float = 0.2,
+    vis: float = 0.9,
+) -> PoseLandmarks:
+    """Phase 9-A 3 신호 시나리오 합성 PoseLandmarks (sanity helper 패턴)."""
+    return PoseLandmarks(
+        shoulder=LandmarkPair(
+            left=_lm(0.45, shoulder_y, vis), right=_lm(0.55, shoulder_y, vis)
+        ),
+        hip=LandmarkPair(
+            left=_lm(hip_x - 0.02, hip_y, vis), right=_lm(hip_x + 0.02, hip_y, vis)
+        ),
+        knee=LandmarkPair(left=_lm(0.5, 0.65, vis), right=_lm(0.5, 0.65, vis)),
+        ankle=LandmarkPair(left=_lm(0.5, 0.85, vis), right=_lm(0.5, 0.85, vis)),
+        heel=LandmarkPair(left=_lm(0.48, 0.88, vis), right=_lm(0.52, 0.88, vis)),
+        foot_index=LandmarkPair(
+            left=_lm(0.52, 0.88, vis), right=_lm(0.52, 0.88, vis)
+        ),
+    )
+
+
+@pytest.fixture
+def track_switch_cfg() -> "TrackingStabilityConfig":
+    """Phase 9-A target_switch_detected fixture (TrackingStabilityConfig 재사용)."""
+    from choborunner_ai.config import TrackingStabilityConfig
+    return TrackingStabilityConfig()
+
+
+def _build_scenario(scenario: str) -> list:
+    """Phase 9-A sanity 5 시나리오 합성 (parametrize 입력 builder).
+
+    Scenarios:
+    - 'normal_30f': 정상 30 frame visibility 0.9 → None
+    - 'pass_through_4f': 옆 사람 통과 4 frame (5 미만) → None
+    - 'switch_settle_10f': 옆 사람 정착 10 frame → failed
+    - 'pelvis_only_10f': pelvis만 위반 (visibility 0.9 유지) → None
+    - 'visibility_only_10f': visibility만 붕괴 (pelvis 0.5 유지) → None
+    """
+    if scenario == "normal_30f":
+        return [_pl_for_switch() for _ in range(30)]
+    if scenario == "pass_through_4f":
+        return (
+            [_pl_for_switch() for _ in range(15)]
+            + [_pl_for_switch(hip_x=0.8, hip_y=0.3, vis=0.2) for _ in range(4)]
+            + [_pl_for_switch() for _ in range(11)]
+        )
+    if scenario == "switch_settle_10f":
+        return (
+            [_pl_for_switch() for _ in range(15)]
+            + [_pl_for_switch(hip_x=0.8, hip_y=0.3, vis=0.2) for _ in range(10)]
+            + [_pl_for_switch() for _ in range(5)]
+        )
+    if scenario == "pelvis_only_10f":
+        return (
+            [_pl_for_switch() for _ in range(15)]
+            + [_pl_for_switch(hip_x=0.8) for _ in range(10)]  # visibility 0.9 유지
+            + [_pl_for_switch() for _ in range(5)]
+        )
+    if scenario == "visibility_only_10f":
+        return (
+            [_pl_for_switch() for _ in range(15)]
+            + [_pl_for_switch(vis=0.2) for _ in range(10)]  # pelvis 0.5 유지
+            + [_pl_for_switch() for _ in range(5)]
+        )
+    raise ValueError(f"unknown scenario: {scenario}")
+
+
+@pytest.mark.parametrize(
+    "scenario,expected_trigger",
+    [
+        ("normal_30f", False),
+        ("pass_through_4f", False),  # 4 frame < 5 (lock B-2)
+        ("switch_settle_10f", True),  # 10 frame >= 5, 메인 trigger
+        ("pelvis_only_10f", False),  # AND 조건 (visibility 0.9 유지)
+        ("visibility_only_10f", False),  # AND 조건 (pelvis 0.5 유지)
+    ],
+)
+def test_evaluate_target_switch_sanity(
+    track_switch_cfg, scenario, expected_trigger
+):
+    """Phase 9-A sanity 5 case parametrize — 3 신호 AND + 5 frame 연속 정책 검증.
+
+    anchor lock:
+    - B-1 β: TrackingStabilityConfig 단일 SoT
+    - B-2: 5 frame 연속 정책 (false positive 방지)
+    - B-3: 계산식 (pelvis α / scale γ / window α)
+    - B-4: visibility frame-level 절대값
+    """
+    landmarks = _build_scenario(scenario)
+    out = evaluate_target_switch(landmarks, 30.0, track_switch_cfg)
+    if expected_trigger:
+        assert out is not None
+        assert out.reason_code == "target_switch_detected"
+        assert out.severity == "failed"
+    else:
+        assert out is None
+
+
+def test_evaluate_target_switch_fps_zero_safe(track_switch_cfg):
+    """fps=0 → fps_safe = 30.0 fallback (Phase 7-A / 8-E 패턴 일관, failed-safe)."""
+    landmarks = [_pl_for_switch() for _ in range(30)]
+    out = evaluate_target_switch(landmarks, 0.0, track_switch_cfg)
+    # 정상 frame이므로 fallback 후에도 trigger X
+    assert out is None
+
+
+def test_evaluate_target_switch_empty_input(track_switch_cfg):
+    """빈 list → None (failed-safe, 빈 입력 guard)."""
+    out = evaluate_target_switch([], 30.0, track_switch_cfg)
+    assert out is None
